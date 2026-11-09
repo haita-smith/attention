@@ -252,6 +252,80 @@ sealed interface AttentionCommand {
             return AttentionCommandResult(restored, timeEntries = listOf(entry))
         }
     }
+
+    // ---- 目标树管理 command(P1.1 #241)----
+    //
+    // 本块全部是对既有引擎纯函数的薄包装:规则只活在 AttentionEngine 一处,command
+    // 不复制校验、不改写结果。目标动作不触碰时间记录与里程碑,返回值只带 state;
+    // 未来移动的生效界线一律取执行时刻的规划日(planningDate(now, zone)),与工具
+    // 快照、周期结算对「今天」的理解同源。
+
+    /** 在指定父目标(缺省为根)之下新建一个目标,排在同层末尾。 */
+    data class CreateTarget(val title: String, val parentId: String? = null) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addTarget(title, parentId))
+    }
+
+    /** 重命名一个已有目标;名称必须非空白,目标必须存在。 */
+    data class RenameTarget(val targetId: String, val title: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.renameTarget(targetId, title))
+    }
+
+    /** 把目标在同层内重排到 [newIndex](0 起,越界拒绝)。 */
+    data class ReorderTarget(val targetId: String, val newIndex: Int) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.reorderTarget(targetId, newIndex))
+    }
+
+    /** 展开或折叠一个目标分支;排序与展开折叠是持久化的领域状态,不是纯视图偏好。 */
+    data class SetTargetExpanded(val targetId: String, val expanded: Boolean) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.setTargetExpanded(targetId, expanded))
+    }
+
+    /** 立即换父;防移入自身或后代,自动排到新父末尾(规则在 [AttentionState.moveTarget])。 */
+    data class MoveTarget(val targetId: String, val newParentId: String?) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.moveTarget(targetId, newParentId))
+    }
+
+    /** 安排一次未来生效的换父;生效日必须晚于执行时刻的规划日。 */
+    data class ScheduleTargetMove(val targetId: String, val parentId: String?, val effectiveFrom: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addFutureTargetMove(targetId, parentId, effectiveFrom, state.planningDate(now, zone)))
+    }
+
+    /**
+     * 修改一笔尚未生效的未来移动的父目标与生效日;移动的 id 与所属目标不可改。
+     * 先按 [moveId] 取出既有移动、保持身份字段原样,再交既有领域函数按唯一性与
+     * 生效界线校验更新——查找失败与校验失败都原样上行,不在此翻译或吞并。
+     */
+    data class UpdateTargetMove(val moveId: String, val parentId: String?, val effectiveFrom: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult {
+            val existing = state.targetMoves.firstOrNull { it.id == moveId } ?: error("未来目标移动不存在")
+            val updated = existing.copy(parentId = parentId, effectiveFrom = effectiveFrom)
+            return AttentionCommandResult(state.updateFutureTargetMove(updated, state.planningDate(now, zone)))
+        }
+    }
+
+    /** 取消一笔尚未生效的未来移动;已生效的历史移动不可取消,也不可改写。 */
+    data class CancelTargetMove(val moveId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.cancelFutureTargetMove(moveId, state.planningDate(now, zone)))
+    }
+
+    /** 归档一个目标;指向它的活动计时器置为未归属,时间记录保持原样。 */
+    data class ArchiveTarget(val targetId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.archiveTarget(targetId))
+    }
+
+    /** 恢复若干归档目标,并级联恢复其归档祖先,层级与排序原样保留。 */
+    data class RestoreTargets(val targetIds: Set<String>) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.restoreTargets(targetIds))
+    }
 }
 
 /** Result returned by every [AttentionCommand]. */
