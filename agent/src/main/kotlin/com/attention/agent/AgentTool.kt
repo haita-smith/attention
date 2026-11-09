@@ -56,6 +56,11 @@ sealed interface ToolExecution {
  * 目录同时接收只读（[AgentTool]）与变更（[ChangeTool]）两类工具，并把同步只读
  * 执行与挂起变更执行适配成统一的挂起 [execute]：循环对两类工具一视同仁，
  * 只读接口与循环的只读语义不因变更通道的存在而改变。
+ *
+ * [confirmationEnabled] 是确认通道的构造期降级开关：关闭时确认级动作整体不可达
+ * （一律错误观测，与是否装配 [ConfirmationGate] 无关）——宁可不可用，不可绕过确认，
+ * 绝不静默降级为自动执行；运行期不切换，需要时由组合根重建目录。开启时确认语义
+ * 与 P0.2 交付的短路终态与确认回调完全一致。
  */
 class ToolCatalog(
     tools: List<AgentTool> = emptyList(),
@@ -63,6 +68,7 @@ class ToolCatalog(
     executor: CommandExecutor? = null,
     clock: ChangeClockSource? = null,
     gate: ConfirmationGate? = null,
+    private val confirmationEnabled: Boolean = true,
 ) {
     private val byName: Map<String, AgentTool> = tools.associateBy { it.name }
     private val changeByName: Map<String, ChangeTool> = changeTools.associateBy { it.name }
@@ -128,12 +134,14 @@ class ToolCatalog(
 
     /**
      * 确认级的登记相：解析出 command 交给确认回调入口持有，以待确认结果短路上行。
-     * 确认通道缺失即该级动作整体不可达——宁可报错，不产生令牌、不派发、不静默转自动；
-     * 解析失败是工具侧失败，与 Auto 级同口径收敛为错误观测，同样不产生令牌。
+     * 确认通道关闭或缺失即该级动作整体不可达——宁可报错，不产生令牌、不派发、
+     * 不静默转自动；解析失败是工具侧失败，与 Auto 级同口径收敛为错误观测，同样不产生令牌。
      */
     private suspend fun executeConfirmation(tool: ChangeTool, args: JsonObject): ToolExecution {
         val gate = confirmationGate
-            ?: return ToolExecution.Observed(errorObservation("需确认操作暂不可用"))
+        if (!confirmationEnabled || gate == null) {
+            return ToolExecution.Observed(errorObservation("需确认操作暂不可用"))
+        }
         val command = try {
             tool.command(args)
         } catch (cancelled: CancellationException) {
