@@ -39,6 +39,8 @@ android {
 dependencies {
     implementation(project(":domain"))
     implementation(project(":workspace-state"))
+    // 单向依赖:助手能力件(:agent)只在 :app 组合根装配,反向依赖不存在(ADR-0009)
+    implementation(project(":agent"))
     implementation(platform(libs.compose.bom))
     androidTestImplementation(platform(libs.compose.bom))
 

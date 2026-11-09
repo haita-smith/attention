@@ -54,6 +54,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
+import com.attention.app.agent.rememberWorkspaceAgentRuntime
 import com.attention.app.data.AttentionStateRepository
 import com.attention.app.data.RoomAttentionStateRepository
 import com.attention.app.data.backup.BackupCommitResult
@@ -624,6 +625,9 @@ fun WorkspaceApp(openScheduleDate: String? = null, openScheduleId: String? = nul
         )
     }
     val viewModel: AttentionViewModel = viewModel(factory = WorkspaceViewModelFactory(repository))
+    // 助手运行时在组合根一处装配(ADR-0009 写入点):审计与快照只挂在包装通道上,
+    // 手动派发路径零改动;本票不接任何 UI 触发,#230 注入 Reasoner、对话页接线后 run 才可达。
+    rememberWorkspaceAgentRuntime(repository = repository, viewModel = viewModel)
     val investmentActions: InvestmentActions = viewModel
     val settingsPlanningActions: SettingsPlanningActions = viewModel
     val onboardingPlanningActions: OnboardingPlanningActions = viewModel
