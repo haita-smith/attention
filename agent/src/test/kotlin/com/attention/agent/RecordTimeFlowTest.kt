@@ -227,6 +227,34 @@ class RecordTimeFlowTest {
     }
 
     @Test
+    fun edit_refusal_dispatches_nothing_and_the_token_cannot_be_replayed() = runTest {
+        val state = stateWithEntries()
+        val ownedId = state.timeEntries.first { it.targetId != null }.id
+        val executor = ExecutingExecutor(state)
+        val gate = ConfirmationGate(executor, clock)
+        val tool = RecordTimeTool(sourceOf(state))
+        val args = buildJsonObject {
+            put("action", "edit")
+            put("entryId", ownedId)
+            put("durationMinutes", 45)
+            put("targetId", "flow-target")
+        }
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求编辑历史记录", ActionRequest("record_time", args)),
+        )
+
+        val pending = ReActAgent(reasoner, catalog(tool, executor, gate)).run("把那条 40 分钟的改成 45 分钟")
+            as AgentOutcome.PendingConfirmation
+
+        // 拒绝即裁决:executor 零派发,账本保持原样(记录仍是 40 分钟);同一令牌再确认不得派发
+        assertEquals(ConfirmationResolution.Cancelled, gate.cancel(pending.token))
+        assertEquals(0, executor.dispatchCount)
+        assertEquals(ConfirmationResolution.AlreadyResolved, gate.confirm(pending.token))
+        assertEquals(0, executor.dispatchCount)
+        assertEquals(40, state.timeEntries.first { it.id == ownedId }.durationMinutes)
+    }
+
+    @Test
     fun an_unknown_record_id_on_a_confirmation_action_becomes_an_error_observation_without_a_token_or_dispatch() = runTest {
         val state = stateWithEntries()
         val executor = ExecutingExecutor(state)

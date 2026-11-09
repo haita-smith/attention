@@ -5,6 +5,7 @@ import com.attention.domain.AttentionCommandResult
 import com.attention.domain.AttentionState
 import com.attention.domain.Target
 import com.attention.domain.addTimeEntry
+import com.attention.domain.editTimeEntry
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
@@ -270,6 +271,61 @@ class RecordTimeToolTest {
         val planningDateDescription = properties["planningDate"]!!.jsonObject["description"]!!.jsonPrimitive.content
         assertTrue("planningDate 描述应绑定 backfill", planningDateDescription.contains("backfill"))
         assertTrue("planningDate 描述不得提 edit", !planningDateDescription.contains("edit"))
+    }
+
+    @Test
+    fun edit_without_a_note_argument_passes_through_the_snapshot_note() {
+        // 底座上一条带备注的已归属记录、一条无备注的已归属记录
+        val state = baseState()
+            .addTimeEntry("2026-03-02", 40, "ledger-target", note = "原始备注")
+            .addTimeEntry("2026-03-03", 25, "ledger-target")
+        val tool = tool(state)
+        val notedId = state.timeEntries.first { it.note == "原始备注" }.id
+        val unnotedId = state.timeEntries.first { it.targetId != null && it.note.isNullOrBlank() }.id
+        fun editArgs(entryId: String, note: String?): JsonObject = buildJsonObject {
+            put("action", "edit")
+            put("entryId", entryId)
+            put("durationMinutes", 45)
+            put("targetId", "ledger-target")
+            note?.let { put("note", it) }
+        }
+
+        // 缺省 note:透传解析相快照中的现值,历史备注不被静默清空(schema 标注 note 可选)
+        val keepCommand = tool.command(editArgs(notedId, null)) as AttentionCommand.EditTimeEntry
+        assertEquals("原始备注", keepCommand.note)
+        val keepResult = keepCommand.execute(state, DISPATCH_NOW, DISPATCH_ZONE)
+        assertEquals("原始备注", keepResult.timeEntries.first { it.id == notedId }.note)
+
+        // 显式 note:替换现值,缺省语义不影响显式改写
+        val replaceCommand = tool.command(editArgs(notedId, "换了备注")) as AttentionCommand.EditTimeEntry
+        assertEquals("换了备注", replaceCommand.note)
+        val replaceResult = replaceCommand.execute(state, DISPATCH_NOW, DISPATCH_ZONE)
+        assertEquals("换了备注", replaceResult.timeEntries.first { it.id == notedId }.note)
+
+        // 现备注本就为空的记录缺省 edit:按空串透传,与投影「空白省略」同口径
+        val unnotedCommand = tool.command(editArgs(unnotedId, null)) as AttentionCommand.EditTimeEntry
+        assertEquals("", unnotedCommand.note)
+    }
+
+    @Test
+    fun the_note_passed_through_on_edit_is_the_parse_phase_snapshot_value() {
+        // TOCTOU 语义与既有窗口一致:command 在解析相定格,备注透传读的是与存在性
+        // 预校验同一份快照;快照之后另有写入方改写备注,已持有的 command 不受影响
+        val state = baseState().addTimeEntry("2026-03-02", 40, "ledger-target", note = "原始备注")
+        val tool = tool(state)
+        val ownedId = state.timeEntries.single { it.targetId != null }.id
+        val command = tool.command(
+            buildJsonObject {
+                put("action", "edit")
+                put("entryId", ownedId)
+                put("durationMinutes", 45)
+                put("targetId", "ledger-target")
+            },
+        ) as AttentionCommand.EditTimeEntry
+
+        val mutated = state.editTimeEntry(ownedId, 40, "ledger-target", "旁路改写")
+        val result = command.execute(mutated, DISPATCH_NOW, DISPATCH_ZONE)
+        assertEquals("原始备注", result.timeEntries.first { it.id == ownedId }.note)
     }
 
     @Test

@@ -3,10 +3,6 @@ package com.attention.agent
 import com.attention.domain.AttentionCommand
 import com.attention.domain.AttentionCommandResult
 import com.attention.domain.AttentionState
-import com.attention.domain.TimeEntry
-import com.attention.domain.timerTargetLabel
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
@@ -31,13 +27,16 @@ import kotlinx.serialization.json.putJsonObject
  * 把守;快照到执行之间的 TOCTOU 窗口按 P0 契约收敛为失败终态,轨迹保留可诊断。
  *
  * 编辑的白名单由 schema 与 command 双重锁定:可改字段仅分钟数、目标与备注,args 与
- * schema 都没有日期字段——日期是账本事实,助手不能改(2026-11-09 裁决)。scheduleEntryId
- * 恒不暴露:日程链路本阶段排除。
+ * schema 都没有日期字段——日期是账本事实,助手不能改(2026-11-09 裁决)。备注可选的
+ * 语义是「省略即保持原值」:args 缺省 note 时透传解析相快照中该记录的现备注,显式
+ * 传入才替换——静默清空历史备注违背 schema 的可选标注。scheduleEntryId 恒不暴露:
+ * 日程链路本阶段排除。
  *
- * 观测相([ChangeTool.observation])投影为扁平记录条目(缺省字段省略、null 不写):
+ * 观测相([ChangeTool.observation])投影为扁平记录条目(缺省字段省略、null 不写,
+ * 共享投影见 [timeEntryEntry]):
  * 补记与归属呈现新记账,编辑呈现改后记录,删除以被删记录回执呈现(状态里已查不到,
  * 从 [AttentionCommandResult.removedTimeEntries] 取);targetTitle 用引擎的
- * [timerTargetLabel],未归属兜底「未归属活动」。只含受影响记录,不回显全量账本
+ * timerTargetLabel,未归属兜底「未归属活动」。只含受影响记录,不回显全量账本
  * (隐私最小化)。
  */
 class RecordTimeTool(private val source: WorkspaceSource) : ChangeTool {
@@ -88,33 +87,36 @@ class RecordTimeTool(private val source: WorkspaceSource) : ChangeTool {
     }
 
     /** 按 action 静态定级;未知 action 与缺 action 同为解析失败,零派发。 */
-    override fun riskLevel(args: JsonObject): RiskLevel = ACTION_RISK.getValue(action(args))
+    override fun riskLevel(args: JsonObject): RiskLevel = ACTION_RISK.getValue(actionArg(args, ACTION_RISK.keys))
 
     /**
      * 解析相:形状校验 + 快照预校验。快照只在解析开始时取一次,
      * 一次调用内的预校验基于同一份一致视图。
      */
     override fun command(args: JsonObject): AttentionCommand {
-        val snapshot = source.snapshot().state
-        return when (action(args)) {
+        val snapshot = source.snapshot()
+        return when (actionArg(args, ACTION_RISK.keys)) {
             ACTION_BACKFILL -> AttentionCommand.AddManualTimeEntry(
                 planningDate = requiredDayArg(args, FIELD_PLANNING_DATE).toString(),
-                durationMinutes = positiveMinutes(args),
-                targetId = optionalStringArg(args, FIELD_TARGET_ID)?.let { snapshot.existingTargetId(it) },
+                durationMinutes = requiredPositiveIntArg(args, FIELD_DURATION_MINUTES),
+                targetId = optionalStringArg(args, FIELD_TARGET_ID)?.let { snapshot.requireTargetExists(it, FIELD_TARGET_ID) },
                 note = optionalStringArg(args, FIELD_NOTE) ?: "",
             )
             ACTION_ASSIGN -> AttentionCommand.AssignUnowned(
-                entryIds = snapshot.existingEntryIds(args),
-                targetId = snapshot.existingTargetId(requiredStringArg(args, FIELD_TARGET_ID)),
+                entryIds = snapshot.state.existingEntryIds(args),
+                targetId = snapshot.requireTargetExists(requiredStringArg(args, FIELD_TARGET_ID), FIELD_TARGET_ID),
             )
-            ACTION_EDIT -> AttentionCommand.EditTimeEntry(
-                entryId = snapshot.existingEntryId(requiredStringArg(args, FIELD_ENTRY_ID)),
-                durationMinutes = positiveMinutes(args),
-                targetId = snapshot.existingTargetId(requiredStringArg(args, FIELD_TARGET_ID)),
-                note = optionalStringArg(args, FIELD_NOTE) ?: "",
-            )
+            ACTION_EDIT -> {
+                val entryId = snapshot.state.existingEntryId(requiredStringArg(args, FIELD_ENTRY_ID))
+                AttentionCommand.EditTimeEntry(
+                    entryId = entryId,
+                    durationMinutes = requiredPositiveIntArg(args, FIELD_DURATION_MINUTES),
+                    targetId = snapshot.requireTargetExists(requiredStringArg(args, FIELD_TARGET_ID), FIELD_TARGET_ID),
+                    note = optionalStringArg(args, FIELD_NOTE) ?: snapshot.state.currentNote(entryId),
+                )
+            }
             ACTION_DELETE -> AttentionCommand.DeleteTimeEntry(
-                snapshot.existingEntryId(requiredStringArg(args, FIELD_ENTRY_ID)),
+                snapshot.state.existingEntryId(requiredStringArg(args, FIELD_ENTRY_ID)),
             )
             else -> throw IllegalArgumentException("action 必须是 $ACTION_CHOICES")
         }
@@ -122,51 +124,15 @@ class RecordTimeTool(private val source: WorkspaceSource) : ChangeTool {
 
     /** 观测相:补记/归属/编辑投影受影响记录,删除以被删记录回执。 */
     override fun observation(args: JsonObject, result: AttentionCommandResult): JsonObject = buildJsonObject {
-        if (action(args) == ACTION_DELETE) {
+        if (actionArg(args, ACTION_RISK.keys) == ACTION_DELETE) {
             putJsonArray(FIELD_REMOVED_ENTRIES) {
-                result.removedTimeEntries.forEach { add(result.state.recordEntry(it)) }
+                result.removedTimeEntries.forEach { add(result.state.timeEntryEntry(it)) }
             }
         } else {
             putJsonArray("entries") {
-                result.timeEntries.forEach { add(result.state.recordEntry(it)) }
+                result.timeEntries.forEach { add(result.state.timeEntryEntry(it)) }
             }
         }
-    }
-
-    /**
-     * 扁平记录条目投影(本地私有实现;与并行的 timer_control 各自持有,评审轮统一):
-     * id/planningDate/durationMinutes/source 恒写,targetId 与备注缺省省略,
-     * targetTitle 用引擎标签——与 query_timer 的口径同源,永不自造。
-     */
-    private fun AttentionState.recordEntry(entry: TimeEntry): JsonObject = buildJsonObject {
-        put("id", entry.id)
-        put("planningDate", entry.planningDate)
-        put("durationMinutes", entry.durationMinutes)
-        entry.targetId?.let { put("targetId", it) }
-        put("targetTitle", timerTargetLabel(entry.targetId))
-        put("source", entry.source.name)
-        if (entry.note.isNotBlank()) put("note", entry.note)
-    }
-
-    private fun action(args: JsonObject): String {
-        val raw = optionalStringArg(args, FIELD_ACTION) ?: throw IllegalArgumentException("$FIELD_ACTION 必填:$ACTION_CHOICES")
-        require(raw in ACTION_RISK) { "action 必须是 $ACTION_CHOICES,实际「$raw」" }
-        return raw
-    }
-
-    /** 分钟数为正整数;非整数与零值负值同为形状错误,在派发之前抛出。 */
-    private fun positiveMinutes(args: JsonObject): Int {
-        val raw = optionalStringArg(args, FIELD_DURATION_MINUTES) ?: throw IllegalArgumentException("$FIELD_DURATION_MINUTES 必填")
-        val minutes = raw.toIntOrNull() ?: throw IllegalArgumentException("$FIELD_DURATION_MINUTES 必须是正整数,实际「$raw」")
-        require(minutes > 0) { "$FIELD_DURATION_MINUTES 必须是正整数,实际 $minutes" }
-        return minutes
-    }
-
-    // ---- 存在性预校验(解析相第二段,基于 WorkspaceSource 快照)----
-
-    private fun AttentionState.existingTargetId(id: String): String {
-        require(targets.any { it.id == id }) { "目标不存在:「$id」" }
-        return id
     }
 
     private fun AttentionState.existingEntryId(id: String): String {
@@ -175,17 +141,18 @@ class RecordTimeTool(private val source: WorkspaceSource) : ChangeTool {
     }
 
     private fun AttentionState.existingEntryIds(args: JsonObject): Set<String> {
-        val element = args[FIELD_ENTRY_IDS] ?: throw IllegalArgumentException("$FIELD_ENTRY_IDS 必填且不能为空")
-        if (element is JsonNull) throw IllegalArgumentException("$FIELD_ENTRY_IDS 必填且不能为空")
-        require(element is JsonArray) { "$FIELD_ENTRY_IDS 必须是字符串数组" }
-        val ids = element.map { item ->
-            require(item is JsonPrimitive && item !is JsonNull) { "$FIELD_ENTRY_IDS 必须是字符串数组" }
-            item.content
-        }
-        require(ids.isNotEmpty()) { "$FIELD_ENTRY_IDS 必填且不能为空" }
+        val ids = optionalStringListArg(args, FIELD_ENTRY_IDS)
+        require(!ids.isNullOrEmpty()) { "$FIELD_ENTRY_IDS 必填且不能为空" }
         ids.forEach { existingEntryId(it) }
         return ids.toSet()
     }
+
+    /**
+     * 解析相快照中该记录的现备注:edit 的 note 缺省透传值。快照先经 [existingEntryId]
+     * 预校验,此查找必然命中;无备注记录的现值为空串,与投影「空白省略」同口径。
+     */
+    private fun AttentionState.currentNote(entryId: String): String =
+        timeEntries.first { it.id == entryId }.note
 
     companion object {
         /**

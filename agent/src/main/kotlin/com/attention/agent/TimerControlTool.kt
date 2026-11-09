@@ -3,7 +3,6 @@ package com.attention.agent
 import com.attention.domain.ActiveTimer
 import com.attention.domain.AttentionCommand
 import com.attention.domain.AttentionCommandResult
-import com.attention.domain.AttentionState
 import com.attention.domain.TimeEntry
 import com.attention.domain.elapsedMillis
 import com.attention.domain.timerTargetLabel
@@ -68,7 +67,7 @@ class TimerControlTool(private val source: WorkspaceSource) : ChangeTool {
     override val riskLevels = ACTION_RISK.values.toSet()
 
     /** 按 action 静态定级;未知 action 与缺 action 同为解析失败,零派发。 */
-    override fun riskLevel(args: JsonObject): RiskLevel = ACTION_RISK.getValue(action(args))
+    override fun riskLevel(args: JsonObject): RiskLevel = ACTION_RISK.getValue(actionArg(args, ACTION_RISK.keys))
 
     /**
      * 解析相:action 判别 + 快照预校验。快照只在解析开始时取一次,一次调用内的
@@ -76,7 +75,7 @@ class TimerControlTool(private val source: WorkspaceSource) : ChangeTool {
      */
     override fun command(args: JsonObject): AttentionCommand {
         val snapshot = source.snapshot()
-        return when (action(args)) {
+        return when (actionArg(args, ACTION_RISK.keys)) {
             ACTION_START -> AttentionCommand.StartTimer(snapshot.optionalExistingTarget(args))
             ACTION_PAUSE -> AttentionCommand.PauseTimer
             ACTION_RESUME -> AttentionCommand.ResumeTimer
@@ -88,7 +87,7 @@ class TimerControlTool(private val source: WorkspaceSource) : ChangeTool {
 
     /** 观测相:计时态对齐 query_timer;stop/switch 追加按规划日排序的结算条目与总分钟。 */
     override fun observation(args: JsonObject, result: AttentionCommandResult): JsonObject {
-        val settled = settledEntries(action(args), result)
+        val settled = settledEntries(actionArg(args, ACTION_RISK.keys), result)
         val state = result.state
         // 时钟事实取快照(ADR-0005):elapsed 与只读查询同源;状态一律用执行结果现算
         val now = source.snapshot().now
@@ -105,7 +104,7 @@ class TimerControlTool(private val source: WorkspaceSource) : ChangeTool {
             }
             if (settled.isNotEmpty()) {
                 putJsonArray("entries") {
-                    settled.sortedBy { it.planningDate }.forEach { add(timeEntryJson(state, it)) }
+                    settled.sortedBy { it.planningDate }.forEach { add(state.timeEntryEntry(it)) }
                 }
                 put("totalMinutes", settled.sumOf { it.durationMinutes })
             }
@@ -119,35 +118,11 @@ class TimerControlTool(private val source: WorkspaceSource) : ChangeTool {
     }
 
     /**
-     * 扁平记录条目(本地私有实现,与并行的 record_time 各自持有,评审轮统一):
-     * id/planningDate/durationMinutes/targetId?/targetTitle/source/note?,缺省省略、
-     * null 不写;scheduleEntryId 不暴露(红线),targetTitle 用引擎兜底「未归属活动」。
-     */
-    private fun timeEntryJson(state: AttentionState, entry: TimeEntry): JsonObject = buildJsonObject {
-        put("id", entry.id)
-        put("planningDate", entry.planningDate)
-        put("durationMinutes", entry.durationMinutes)
-        entry.targetId?.let { put("targetId", it) }
-        put("targetTitle", state.timerTargetLabel(entry.targetId))
-        put("source", entry.source.name)
-        if (entry.note.isNotBlank()) put("note", entry.note)
-    }
-
-    private fun action(args: JsonObject): String {
-        val raw = optionalStringArg(args, FIELD_ACTION) ?: throw IllegalArgumentException("$FIELD_ACTION 必填:$ACTION_CHOICES")
-        require(raw in ACTION_RISK) { "action 必须是 $ACTION_CHOICES,实际「$raw」" }
-        return raw
-    }
-
-    /**
      * start/switch 的可空目标 id:缺省即未归属计时;给了 id 就必须在快照中存在
      * (归档目标的存在性放行,拒绝留引擎执行期,领域规则不前置复制)。
      */
     private fun WorkspaceView.optionalExistingTarget(args: JsonObject): String? =
-        optionalStringArg(args, FIELD_TARGET_ID)?.let { id ->
-            require(state.targets.any { it.id == id }) { "目标不存在:$FIELD_TARGET_ID=「$id」" }
-            id
-        }
+        optionalStringArg(args, FIELD_TARGET_ID)?.let { requireTargetExists(it, FIELD_TARGET_ID) }
 
     companion object {
         /**

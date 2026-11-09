@@ -28,9 +28,9 @@ import org.junit.Test
 /**
  * timer_control 工具(#245)的外部行为:5 个 action 的 args → 风险级别(全 Auto)、
  * 领域 command 字段、观测形状三段映射;schema 可解析且字段描述齐;解析相预校验把
- * 未知目标 id 挡在派发之前。循环级全链路(开始→切换→停止 command 序列、跨规划日
- * 拆分投影、无计时器 stop 幂等、同目标切换幂等、错误观测零派发)在同一文件后半部,
- * 均在最高接缝(ReActAgent.run)上验证。
+ * 未知目标 id 挡在派发之前;工具面不出现任何平台效果通道。循环级全链路(开始→切换→
+ * 停止 command 序列、跨规划日拆分投影、无计时器 stop 幂等、同目标切换幂等、错误观测
+ * 零派发)在同一文件后半部,均在最高接缝(ReActAgent.run)上验证。
  */
 class TimerControlToolTest {
 
@@ -359,6 +359,28 @@ class TimerControlToolTest {
             observation(running = true, paused = false, targetTitle = "专注", targetId = focus.id, elapsedMillis = 900_000),
             payload,
         )
+    }
+
+    @Test
+    fun the_tool_surface_has_no_platform_effect_channel() {
+        // 平台效果边界:工具只持有 WorkspaceSource、只产出领域 command 与投影,
+        // 通知、前台服务归 app 层 TimerEffects——工具面不得出现任何平台类型
+        val violations = mutableListOf<String>()
+        TimerControlTool::class.java.declaredFields.forEach { field ->
+            if (field.type.name.startsWith("android")) violations += "字段 ${field.name}:${field.type.name}"
+        }
+        TimerControlTool::class.java.declaredMethods.forEach { method ->
+            if (method.returnType.name.startsWith("android")) violations += "方法 ${method.name} 返回 ${method.returnType.name}"
+            method.parameterTypes.filter { it.name.startsWith("android") }.forEach {
+                violations += "方法 ${method.name} 参数 ${it.name}"
+            }
+        }
+        TimerControlTool::class.java.constructors.forEach { constructor ->
+            constructor.parameterTypes.filter { it.name.startsWith("android") }.forEach {
+                violations += "构造参数 ${it.name}"
+            }
+        }
+        assertTrue("工具面出现平台类型:$violations", violations.isEmpty())
     }
 
     @Test

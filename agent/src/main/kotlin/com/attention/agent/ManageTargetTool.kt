@@ -5,7 +5,6 @@ import com.attention.domain.AttentionCommandResult
 import com.attention.domain.AttentionState
 import com.attention.domain.Target
 import com.attention.domain.TargetMove
-import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonNull
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
@@ -109,7 +108,7 @@ class ManageTargetTool(private val source: WorkspaceSource) : ChangeTool {
     override val riskLevels = ACTION_RISK.values.toSet()
 
     /** 按 action 静态定级;未知 action 与缺 action 同为解析失败,零派发。 */
-    override fun riskLevel(args: JsonObject): RiskLevel = ACTION_RISK.getValue(action(args))
+    override fun riskLevel(args: JsonObject): RiskLevel = ACTION_RISK.getValue(actionArg(args, ACTION_RISK.keys))
 
     /**
      * 解析相:形状校验 + 快照预校验。快照只在解析开始时取一次,
@@ -118,7 +117,7 @@ class ManageTargetTool(private val source: WorkspaceSource) : ChangeTool {
     override fun command(args: JsonObject): AttentionCommand {
         val snapshot = source.snapshot()
         moveOldParentId = null
-        return when (val action = action(args)) {
+        return when (val action = actionArg(args, ACTION_RISK.keys)) {
             ACTION_CREATE -> AttentionCommand.CreateTarget(
                 title = requiredStringArg(args, FIELD_TITLE),
                 parentId = snapshot.optionalTarget(args, FIELD_PARENT_ID),
@@ -172,7 +171,7 @@ class ManageTargetTool(private val source: WorkspaceSource) : ChangeTool {
 
     /** 观测相:受影响目标及涉父目标的扁平条目,立即换父附旧父,未来移动类附带回执。 */
     override fun observation(args: JsonObject, result: AttentionCommandResult): JsonObject {
-        val action = action(args)
+        val action = actionArg(args, ACTION_RISK.keys)
         val state = result.state
         // 规划日取自快照的时钟事实(ADR-0005):进度汇总与只读查询同源;
         // 汇总一律以执行结果状态现算,快照只提供时钟
@@ -194,7 +193,7 @@ class ManageTargetTool(private val source: WorkspaceSource) : ChangeTool {
         val targets = when (action) {
             // addTarget 恒把新建目标追加在末尾,新建者即最后一个
             ACTION_CREATE -> listOfNotNull(state.targets.lastOrNull())
-            ACTION_RESTORE -> optionalStringList(args, FIELD_TARGET_IDS).orEmpty().mapNotNull { state.targetById(it) }
+            ACTION_RESTORE -> optionalStringListArg(args, FIELD_TARGET_IDS).orEmpty().mapNotNull { state.targetById(it) }
             ACTION_UPDATE_MOVE -> listOfNotNull(renderedMove(action, args, state)?.let { state.targetById(it.targetId) })
             ACTION_RENAME, ACTION_REORDER, ACTION_SET_EXPANDED, ACTION_MOVE, ACTION_SCHEDULE_MOVE, ACTION_CANCEL_MOVE, ACTION_ARCHIVE ->
                 listOfNotNull(optionalStringArg(args, FIELD_TARGET_ID)?.let { state.targetById(it) })
@@ -225,12 +224,6 @@ class ManageTargetTool(private val source: WorkspaceSource) : ChangeTool {
         put("effectiveFrom", move.effectiveFrom)
     }
 
-    private fun action(args: JsonObject): String {
-        val raw = optionalStringArg(args, FIELD_ACTION) ?: throw IllegalArgumentException("$FIELD_ACTION 必填:$ACTION_CHOICES")
-        require(raw in ACTION_RISK) { "action 必须是 $ACTION_CHOICES,实际「$raw」" }
-        return raw
-    }
-
     // ---- 参数形状校验(解析相第一段,字符串/日期/周期助手见 ToolArgs)----
 
     private fun requiredInt(args: JsonObject, field: String): Int =
@@ -240,33 +233,18 @@ class ManageTargetTool(private val source: WorkspaceSource) : ChangeTool {
         (args[field] as? JsonPrimitive)?.takeUnless { it is JsonNull }?.booleanOrNull
             ?: throw IllegalArgumentException("$field 必须是 true 或 false")
 
-    private fun optionalStringList(args: JsonObject, field: String): List<String>? {
-        val element = args[field] ?: return null
-        if (element is JsonNull) return null
-        require(element is JsonArray) { "$field 必须是字符串数组" }
-        return element.map { item ->
-            require(item is JsonPrimitive && item !is JsonNull) { "$field 必须是字符串数组" }
-            item.content
-        }
-    }
-
     // ---- 存在性与归档态预校验(解析相第二段,基于 WorkspaceSource 快照)----
 
     private fun WorkspaceView.requiredTarget(args: JsonObject, field: String): String =
-        existingTarget(requiredStringArg(args, field), field)
+        requireTargetExists(requiredStringArg(args, field), field)
 
     private fun WorkspaceView.optionalTarget(args: JsonObject, field: String): String? =
-        optionalStringArg(args, field)?.let { existingTarget(it, field) }
-
-    private fun WorkspaceView.existingTarget(id: String, field: String): String {
-        require(state.targets.any { it.id == id }) { "目标不存在:$field=「$id」" }
-        return id
-    }
+        optionalStringArg(args, field)?.let { requireTargetExists(it, field) }
 
     private fun WorkspaceView.requiredTargets(args: JsonObject): Set<String> {
-        val ids = optionalStringList(args, FIELD_TARGET_IDS)
+        val ids = optionalStringListArg(args, FIELD_TARGET_IDS)
         require(!ids.isNullOrEmpty()) { "$FIELD_TARGET_IDS 必填且不能为空" }
-        ids.forEach { existingTarget(it, FIELD_TARGET_IDS) }
+        ids.forEach { requireTargetExists(it, FIELD_TARGET_IDS) }
         return ids.toSet()
     }
 
