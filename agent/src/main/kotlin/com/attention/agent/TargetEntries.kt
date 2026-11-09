@@ -27,3 +27,16 @@ internal fun AttentionState.targetEntry(target: Target, planningDay: LocalDate):
         put("completed", summary.completed)
     }
 }
+
+/**
+ * 目标 id 存在性预校验的共用入口(解析相第二段,基于 [WorkspaceSource] 快照):
+ * id 必须在快照的目标树中存在,未知 id 在派发之前就转为解析失败,由循环折算成
+ * 错误观测回填——自动级免去无效派发,确认级不铸令牌。归档目标的存在性在此放行,
+ * 拒绝属领域规则,仍由引擎执行期把守;快照到执行之间的 TOCTOU 窗口按 P0 契约
+ * 收敛为失败终态。三个变更工具(manage_target/timer_control/record_time)共用
+ * 同一份报错文案,不各说各话。
+ */
+internal fun WorkspaceView.requireTargetExists(id: String, field: String): String {
+    require(state.targets.any { it.id == id }) { "目标不存在:$field=「$id」" }
+    return id
+}

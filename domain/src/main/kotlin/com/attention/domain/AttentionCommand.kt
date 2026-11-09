@@ -413,6 +413,42 @@ sealed interface AttentionCommand {
         override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
             AttentionCommandResult(state.updateGoalStage(stageId, targetMinutes, dueDate, state.planningDate(now, zone)))
     }
+
+    // ---- 计时 command(P2.1 #245)----
+    //
+    // timer_control 工具族派发的领域通道:开始/暂停/恢复此前没有 command(UI 走
+    // updateBusiness 遗留旁路),这里补齐为既有计时纯函数的薄包装——无活动计时器、
+    // 目标未归档、段折入与续开等规则只活在 AttentionEngine 一处,command 不复制
+    // 校验、不改写结果,校验失败原样上行。now 由执行通道注入。停止与切换不在此
+    // 新增:既有 StopTimer/SwitchTimer(同目标幂等、无活动计时器即开始、切换自动
+    // 结算前段)原样复用,零改动。
+
+    /**
+     * 开始一段计时;[targetId] 为 null 表示未归属计时。
+     * 「要求当前无活动计时器、目标未归档」由引擎 [AttentionState.startTimer] 把守。
+     */
+    data class StartTimer(val targetId: String? = null) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.startTimer(targetId, now, zone))
+    }
+
+    /**
+     * 暂停活动计时器:当前段收口折入累计;无活动计时器或已暂停时保持原状
+     * (引擎幂等语义,重复暂停不产生第二段)。
+     */
+    data object PauseTimer : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.pauseTimer(now))
+    }
+
+    /**
+     * 恢复已暂停的计时器:重新开段,已结算的累计不变;无活动计时器或未暂停时
+     * 保持原状(引擎幂等语义)。
+     */
+    data object ResumeTimer : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.resumeTimer(now))
+    }
 }
 
 /** Result returned by every [AttentionCommand]. */
