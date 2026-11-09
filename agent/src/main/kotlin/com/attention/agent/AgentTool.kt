@@ -44,6 +44,9 @@ sealed interface ToolExecution {
 
     /** 执行通道故障：循环以失败终态收敛，trace 保留到该次行动为止。 */
     data class DispatchFailed(val reason: String) : ToolExecution
+
+    /** 确认级动作已登记待派发：循环不回填观测，以待确认终态短路，令牌交回调入口裁决。 */
+    data class AwaitingConfirmation(val token: ConfirmationToken) : ToolExecution
 }
 
 /**
@@ -59,11 +62,13 @@ class ToolCatalog(
     changeTools: List<ChangeTool> = emptyList(),
     executor: CommandExecutor? = null,
     clock: ChangeClockSource? = null,
+    gate: ConfirmationGate? = null,
 ) {
     private val byName: Map<String, AgentTool> = tools.associateBy { it.name }
     private val changeByName: Map<String, ChangeTool> = changeTools.associateBy { it.name }
     private val dispatch: CommandExecutor? = executor
     private val clockSource: ChangeClockSource? = clock
+    private val confirmationGate: ConfirmationGate? = gate
 
     val all: List<AgentTool> = tools.toList()
     val changeTools: List<ChangeTool> = changeTools.toList()
@@ -115,12 +120,28 @@ class ToolCatalog(
         }
         return when (risk) {
             RiskLevel.Auto -> executeAuto(tool, args)
-            // 确认通道不可用即该级动作整体不可达：宁可报错，不产生令牌、不派发、不静默转自动；
-            // 短路终态与回调裁决由确认回调入口接入后提供。
-            RiskLevel.Confirmation -> ToolExecution.Observed(errorObservation("需确认操作暂不可用"))
+            RiskLevel.Confirmation -> executeConfirmation(tool, args)
             // Forbidden 声明在注册期已被拒绝；这里只防工具运行期越级谎报，保持循环不抛。
             RiskLevel.Forbidden -> ToolExecution.Observed(errorObservation("禁止执行的操作：${tool.name}"))
         }
+    }
+
+    /**
+     * 确认级的登记相：解析出 command 交给确认回调入口持有，以待确认结果短路上行。
+     * 确认通道缺失即该级动作整体不可达——宁可报错，不产生令牌、不派发、不静默转自动；
+     * 解析失败是工具侧失败，与 Auto 级同口径收敛为错误观测，同样不产生令牌。
+     */
+    private suspend fun executeConfirmation(tool: ChangeTool, args: JsonObject): ToolExecution {
+        val gate = confirmationGate
+            ?: return ToolExecution.Observed(errorObservation("需确认操作暂不可用"))
+        val command = try {
+            tool.command(args)
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (failure: Throwable) {
+            return ToolExecution.Observed(errorObservation(describeFailure(failure)))
+        }
+        return ToolExecution.AwaitingConfirmation(gate.register(command))
     }
 
     /** Auto 级的派发相：解析与投影是工具侧失败（错误观测），executor 失败是通道故障（值上行）。 */

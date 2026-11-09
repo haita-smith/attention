@@ -29,6 +29,14 @@ sealed class AgentEvent {
     @SerialName("observation")
     data class Observation(val payload: JsonObject, val isError: Boolean = false) : AgentEvent()
 
+    /**
+     * 确认级动作已受理但未执行：记录待确认的工具、参数与令牌，循环到此短路。
+     * command 是否真正派发由用户裁决决定，观测不存在——没有执行就没有可观测的结果。
+     */
+    @Serializable
+    @SerialName("pending_confirmation")
+    data class PendingConfirmation(val tool: String, val args: JsonObject, val token: ConfirmationToken) : AgentEvent()
+
     /** 推理器给出的最终答复，循环到此结束。 */
     @Serializable
     @SerialName("final")
