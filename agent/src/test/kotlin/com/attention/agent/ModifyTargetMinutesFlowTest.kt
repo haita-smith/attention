@@ -1,13 +1,10 @@
 package com.attention.agent
 
 import com.attention.domain.AttentionCommand
-import com.attention.domain.AttentionCommandResult
 import com.attention.domain.AttentionState
 import com.attention.domain.GoalCadence
 import com.attention.domain.GoalStage
 import com.attention.domain.Target
-import java.time.Instant
-import java.time.ZoneId
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -34,22 +31,6 @@ class ModifyTargetMinutesFlowTest {
     )
 
     private fun sourceOf(state: AttentionState) = WorkspaceSource { WorkspaceView(state, DISPATCH_NOW, DISPATCH_ZONE) }
-
-    /** 真执行领域 command 的执行通道:观测投影读到的是执行后的真实状态。 */
-    private class ExecutingExecutor(private val state: AttentionState) : CommandExecutor {
-        val commands = mutableListOf<AttentionCommand>()
-        val nows = mutableListOf<Instant>()
-        val zones = mutableListOf<ZoneId>()
-
-        val dispatchCount: Int get() = commands.size
-
-        override suspend fun execute(command: AttentionCommand, now: Instant, zone: ZoneId): AttentionCommandResult {
-            commands += command
-            nows += now
-            zones += zone
-            return command.execute(state, now, zone)
-        }
-    }
 
     private fun modifyArgs(stageId: String = "flow-stage", targetMinutes: Int = 50) = buildJsonObject {
         put("action", "modify_target_minutes")

@@ -7,14 +7,9 @@ import com.attention.domain.FutureGoalRule
 import com.attention.domain.GoalCadence
 import com.attention.domain.Migration
 import com.attention.domain.Target
-import com.attention.domain.goalSummary
-import com.attention.domain.planningDate
-import java.time.LocalDate
-import java.time.format.DateTimeParseException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -27,12 +22,13 @@ import kotlinx.serialization.json.putJsonObject
  * 意图,不是历史删除),也不声明 [RiskLevel.Forbidden]——永禁操作根本没有 command 通道。
  *
  * 解析相位以 [WorkspaceSource] 快照做存在性预校验:未知目标/阶段/规则/迁移 id、
- * 已完成阶段在解析时转为错误观测回填,推理器可自行纠正;确认级动作因此不会为
- * 无效请求铸造令牌。预校验只钉存在性、归属与完成态,领域规则(生效点边界、
- * 去重更新、一次性阶段拒绝)仍由 `:domain` 的 command 在执行期治理。
+ * 已完成阶段、一次性阶段(没有下一周期边界)在解析时转为错误观测回填,推理器可
+ * 自行纠正;确认级动作因此不会为注定失败的请求铸造令牌。预校验只钉存在性、归属、
+ * 完成态与周期类型,领域规则(生效点边界、去重更新)仍由 `:domain` 的 command
+ * 在执行期治理,引擎才是权威。
  *
- * 观测投影对齐 query_targets 先例:扁平目标条目 + 进度汇总,缺省字段不写,
- * 只含受影响目标,不回显全量状态。
+ * 观测投影对齐 query_targets 先例:扁平目标条目 + 进度汇总([targetEntry],
+ * 与 ManageTargetTool 同一函数),缺省字段不写,只含受影响目标,不回显全量状态。
  */
 class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
 
@@ -45,39 +41,39 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
     override val parametersSchema = buildJsonObject {
         put("type", "object")
         putJsonObject("properties") {
-            putJsonObject("action") {
+            putJsonObject(KEY_ACTION) {
                 put("type", "string")
                 put("description", "set_goal 的动作:$ACTION_CHOICES")
             }
-            putJsonObject("targetId") { put("type", "string"); put("description", "目标 id") }
-            putJsonObject("cadence") {
+            putJsonObject(KEY_TARGET_ID) { put("type", "string"); put("description", "目标 id") }
+            putJsonObject(KEY_CADENCE) {
                 put("type", "string")
                 put("description", "周期类型:$CADENCE_CHOICES")
             }
-            putJsonObject("targetMinutes") {
+            putJsonObject(KEY_TARGET_MINUTES) {
                 put("type", "integer"); put("description", "阶段或未来规则的目标分钟数,正整数")
             }
-            putJsonObject("startDate") { put("type", "string"); put("description", "阶段开始日,YYYY-MM-DD") }
-            putJsonObject("dueDate") { put("type", "string"); put("description", "可选,截止日,YYYY-MM-DD") }
-            putJsonObject("stageId") {
+            putJsonObject(KEY_START_DATE) { put("type", "string"); put("description", "阶段开始日,YYYY-MM-DD") }
+            putJsonObject(KEY_DUE_DATE) { put("type", "string"); put("description", "可选,截止日,YYYY-MM-DD") }
+            putJsonObject(KEY_STAGE_ID) {
                 put("type", "string")
                 put("description", "目标阶段 id:add_future_rule/update_future_rule 缺省为目标级规则;modify_target_minutes 必填,是被修改的阶段")
             }
-            putJsonObject("effectiveFrom") {
+            putJsonObject(KEY_EFFECTIVE_FROM) {
                 put("type", "string"); put("description", "未来规则生效日,必须晚于当前规划日,YYYY-MM-DD")
             }
-            putJsonObject("ruleId") { put("type", "string"); put("description", "未来规则 id,update/cancel_future_rule 必填") }
-            putJsonObject("sourceStageId") { put("type", "string"); put("description", "迁移来源阶段 id") }
-            putJsonObject("minutes") { put("type", "integer"); put("description", "迁移分钟数,不超过来源阶段的剩余缺口") }
-            putJsonObject("destinationStartDate") { put("type", "string"); put("description", "迁移去向开始日,YYYY-MM-DD") }
-            putJsonObject("destinationEndDate") { put("type", "string"); put("description", "可选,迁移去向截止日,YYYY-MM-DD") }
-            putJsonObject("migrationId") { put("type", "string"); put("description", "迁移记录 id,update/cancel_migration 必填") }
+            putJsonObject(KEY_RULE_ID) { put("type", "string"); put("description", "未来规则 id,update/cancel_future_rule 必填") }
+            putJsonObject(KEY_SOURCE_STAGE_ID) { put("type", "string"); put("description", "迁移来源阶段 id") }
+            putJsonObject(KEY_MINUTES) { put("type", "integer"); put("description", "迁移分钟数,不超过来源阶段的剩余缺口") }
+            putJsonObject(KEY_DESTINATION_START) { put("type", "string"); put("description", "迁移去向开始日,YYYY-MM-DD") }
+            putJsonObject(KEY_DESTINATION_END) { put("type", "string"); put("description", "可选,迁移去向截止日,YYYY-MM-DD") }
+            putJsonObject(KEY_MIGRATION_ID) { put("type", "string"); put("description", "迁移记录 id,update/cancel_migration 必填") }
         }
         // 必填契约写进 schema:所有 action 都要指明落在哪个目标上(取消类动作
         // 也用它做归属校验与观测投影),漏标就会漏参
         putJsonArray("required") {
-            add(JsonPrimitive("action"))
-            add(JsonPrimitive("targetId"))
+            add(JsonPrimitive(KEY_ACTION))
+            add(JsonPrimitive(KEY_TARGET_ID))
         }
     }
 
@@ -97,45 +93,48 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
             ACTION_CANCEL_FUTURE_RULE -> parseCancelFutureRule(state, args)
             ACTION_ADD_MIGRATION -> parseAddMigration(state, args)
             ACTION_UPDATE_MIGRATION -> parseUpdateMigration(state, args)
-            else -> parseCancelMigration(state, args)
+            ACTION_CANCEL_MIGRATION -> parseCancelMigration(state, args)
+            // knownAction 已把未知 action 挡在第一相,此分支只为 when 穷尽而保留兜底;
+            // 与 manage_target 同口径:未知 action 显式抛错,绝不静默路由到某个具体语义
+            else -> throw IllegalArgumentException("action 必须是 $ACTION_CHOICES")
         }
     }
 
     private fun parseAddStage(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
         return AttentionCommand.AddGoalStage(
             targetId = target.id,
             cadence = cadenceArg(args),
             targetMinutes = positiveInt(args, KEY_TARGET_MINUTES),
-            startDate = day(args, KEY_START_DATE).toString(),
-            dueDate = optionalDay(args, KEY_DUE_DATE)?.toString(),
+            startDate = requiredDayArg(args, KEY_START_DATE).toString(),
+            dueDate = optionalDayArg(args, KEY_DUE_DATE)?.toString(),
         )
     }
 
     private fun parseAppendOneTimeStage(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
         return AttentionCommand.AppendOneTimeGoalStage(target.id, positiveInt(args, KEY_TARGET_MINUTES))
     }
 
     /**
-     * 修改已生效阶段的时间目标:生效点、去重更新与一次性阶段拒绝由引擎治理,
-     * 这里只预校验阶段存在、归属与未完成(工票钉定的解析相位守卫),让确认级
-     * 动作不会为无效请求铸造令牌。
+     * 修改已生效阶段的时间目标:生效点、去重更新、一次性阶段拒绝由引擎治理,
+     * 这里只预校验阶段存在、归属、未完成与非一次性(工票钉定的解析相位守卫),
+     * 让确认级动作不会为注定失败的请求铸造令牌。
      */
     private fun parseModifyTargetMinutes(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
-        val stageId = string(args, KEY_STAGE_ID)
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
+        val stageId = requiredStringArg(args, KEY_STAGE_ID)
         if (stageId.isBlank()) throw IllegalArgumentException("stageId 必填:modify_target_minutes 修改的是具体阶段")
         requireModifiableStage(state, target.id, stageId)
         return AttentionCommand.UpdateGoalStage(
             stageId = stageId,
             targetMinutes = positiveInt(args, KEY_TARGET_MINUTES),
-            dueDate = optionalDay(args, KEY_DUE_DATE)?.toString(),
+            dueDate = optionalDayArg(args, KEY_DUE_DATE)?.toString(),
         )
     }
 
     private fun parseAddFutureRule(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
         val stageId = optionalStageId(args)
         requireStageOfTarget(state, target.id, stageId)
         return AttentionCommand.AddFutureGoalRule(
@@ -144,15 +143,15 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
                 stageId = stageId,
                 cadence = cadenceArg(args),
                 targetMinutes = positiveInt(args, KEY_TARGET_MINUTES),
-                effectiveFrom = day(args, KEY_EFFECTIVE_FROM).toString(),
-                dueDate = optionalDay(args, KEY_DUE_DATE)?.toString(),
+                effectiveFrom = requiredDayArg(args, KEY_EFFECTIVE_FROM).toString(),
+                dueDate = optionalDayArg(args, KEY_DUE_DATE)?.toString(),
             ),
         )
     }
 
     private fun parseUpdateFutureRule(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
-        val existing = requireRuleOfTarget(state, target.id, string(args, KEY_RULE_ID))
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
+        val existing = requireRuleOfTarget(state, target.id, requiredStringArg(args, KEY_RULE_ID))
         val stageId = optionalStageId(args)
         requireStageOfTarget(state, target.id, stageId)
         // 从既有规则 copy:id 与 targetId 不可改,与引擎「目标和阶段不能修改」同口径
@@ -161,82 +160,69 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
                 stageId = stageId,
                 cadence = cadenceArg(args),
                 targetMinutes = positiveInt(args, KEY_TARGET_MINUTES),
-                effectiveFrom = day(args, KEY_EFFECTIVE_FROM).toString(),
-                dueDate = optionalDay(args, KEY_DUE_DATE)?.toString(),
+                effectiveFrom = requiredDayArg(args, KEY_EFFECTIVE_FROM).toString(),
+                dueDate = optionalDayArg(args, KEY_DUE_DATE)?.toString(),
             ),
         )
     }
 
     private fun parseCancelFutureRule(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireTarget(state, string(args, KEY_TARGET_ID))
-        val existing = requireRuleOfTarget(state, target.id, string(args, KEY_RULE_ID))
+        val target = requireTarget(state, requiredStringArg(args, KEY_TARGET_ID))
+        val existing = requireRuleOfTarget(state, target.id, requiredStringArg(args, KEY_RULE_ID))
         return AttentionCommand.CancelFutureGoalRule(existing.id)
     }
 
     private fun parseAddMigration(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
-        val sourceStageId = string(args, KEY_SOURCE_STAGE_ID)
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
+        val sourceStageId = requiredStringArg(args, KEY_SOURCE_STAGE_ID)
         requireStageOfTarget(state, target.id, sourceStageId)
         return AttentionCommand.AddMigration(
             Migration(
                 targetId = target.id,
                 sourceStageId = sourceStageId,
                 minutes = positiveInt(args, KEY_MINUTES),
-                destinationStartDate = day(args, KEY_DESTINATION_START).toString(),
-                destinationEndDate = optionalDay(args, KEY_DESTINATION_END)?.toString(),
+                destinationStartDate = requiredDayArg(args, KEY_DESTINATION_START).toString(),
+                destinationEndDate = optionalDayArg(args, KEY_DESTINATION_END)?.toString(),
             ),
         )
     }
 
     private fun parseUpdateMigration(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
-        val existing = requireMigrationOfTarget(state, target.id, string(args, KEY_MIGRATION_ID))
-        val sourceStageId = string(args, KEY_SOURCE_STAGE_ID)
+        val target = requireActiveTarget(state, requiredStringArg(args, KEY_TARGET_ID))
+        val existing = requireMigrationOfTarget(state, target.id, requiredStringArg(args, KEY_MIGRATION_ID))
+        val sourceStageId = requiredStringArg(args, KEY_SOURCE_STAGE_ID)
         requireStageOfTarget(state, target.id, sourceStageId)
         return AttentionCommand.UpdateMigration(
             existing.copy(
                 sourceStageId = sourceStageId,
                 minutes = positiveInt(args, KEY_MINUTES),
-                destinationStartDate = day(args, KEY_DESTINATION_START).toString(),
-                destinationEndDate = optionalDay(args, KEY_DESTINATION_END)?.toString(),
+                destinationStartDate = requiredDayArg(args, KEY_DESTINATION_START).toString(),
+                destinationEndDate = optionalDayArg(args, KEY_DESTINATION_END)?.toString(),
             ),
         )
     }
 
     private fun parseCancelMigration(state: AttentionState, args: JsonObject): AttentionCommand {
-        val target = requireTarget(state, string(args, KEY_TARGET_ID))
-        val existing = requireMigrationOfTarget(state, target.id, string(args, KEY_MIGRATION_ID))
+        val target = requireTarget(state, requiredStringArg(args, KEY_TARGET_ID))
+        val existing = requireMigrationOfTarget(state, target.id, requiredStringArg(args, KEY_MIGRATION_ID))
         return AttentionCommand.CancelMigration(existing.id)
     }
 
     override fun observation(args: JsonObject, result: AttentionCommandResult): JsonObject {
-        val targetId = string(args, KEY_TARGET_ID)
+        val targetId = requiredStringArg(args, KEY_TARGET_ID)
         val target = result.state.targets.firstOrNull { it.id == targetId }
             ?: throw IllegalStateException("观测投影找不到目标:$targetId")
         // 规划日取自快照的时钟事实(ADR-0005):与只读工具的进度口径同源
         val planningDay = source.snapshot().planningDay
-        val summary = result.state.goalSummary(target.id, planningDay)
         return buildJsonObject {
-            putJsonArray("targets") {
-                add(buildJsonObject {
-                    put("id", target.id)
-                    put("title", target.title)
-                    target.parentId?.let { put("parentId", it) }
-                    put("archived", target.archived)
-                    put("targetMinutes", summary.targetMinutes)
-                    put("actualMinutes", summary.actualMinutes)
-                    put("gapMinutes", summary.gapMinutes)
-                    put("completed", summary.completed)
-                })
-            }
+            putJsonArray("targets") { add(result.state.targetEntry(target, planningDay)) }
             put("count", 1)
         }
     }
 
     /** 按名判定 action;未知名字在第一相就抛,风险与解析都不再继续。 */
     private fun knownAction(args: JsonObject): String {
-        val raw = args["action"]?.jsonPrimitive?.content
-            ?: throw IllegalArgumentException("action 必填:$ACTION_CHOICES")
+        val raw = optionalStringArg(args, KEY_ACTION) ?: throw IllegalArgumentException("action 必填:$ACTION_CHOICES")
         return ACTIONS.firstOrNull { it == raw }
             ?: throw IllegalArgumentException("action 必须是 $ACTION_CHOICES,实际「$raw」")
     }
@@ -261,12 +247,18 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
         if (stage.targetId != targetId) throw IllegalArgumentException("目标阶段 $stageId 不属于目标 $targetId")
     }
 
-    /** 修改类动作的预校验:阶段必须存在、属于该目标且未完成——历史承诺不可改写。 */
+    /**
+     * 修改类动作的预校验:阶段必须存在、属于该目标、未完成且非一次性——历史承诺
+     * 不可改写,一次性阶段没有下一周期边界。引擎的 updateGoalStage 仍是权威
+     * (执行期同样拒绝),解析相提前拒绝只为不让用户确认一个注定失败的操作,
+     * 与既有 completed 守卫同模式。
+     */
     private fun requireModifiableStage(state: AttentionState, targetId: String, stageId: String) {
         val stage = state.goalStages.firstOrNull { it.id == stageId }
             ?: throw IllegalArgumentException("目标阶段不存在:$stageId")
         if (stage.targetId != targetId) throw IllegalArgumentException("目标阶段 $stageId 不属于目标 $targetId")
         if (stage.completed) throw IllegalArgumentException("目标阶段已完成,不能修改:$stageId")
+        if (stage.cadence == GoalCadence.ONE_TIME) throw IllegalArgumentException("一次性阶段没有下一周期边界,不能修改:$stageId")
     }
 
     private fun requireRuleOfTarget(state: AttentionState, targetId: String, ruleId: String): FutureGoalRule {
@@ -283,39 +275,15 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
         return migration
     }
 
-    /** 读取必填字符串参数;缺失即抛,由循环转成错误观测。 */
-    private fun string(args: JsonObject, key: String): String =
-        args[key]?.jsonPrimitive?.content ?: throw IllegalArgumentException("$key 必填")
-
     /** 读取可选阶段 id:空白折叠为空串(目标级规则),与引擎的 stageId 语义一致。 */
     private fun optionalStageId(args: JsonObject): String =
-        args["stageId"]?.jsonPrimitive?.content?.trim()?.takeIf { it.isNotEmpty() } ?: ""
+        optionalStringArg(args, KEY_STAGE_ID)?.trim()?.takeIf { it.isNotEmpty() } ?: ""
 
     private fun positiveInt(args: JsonObject, key: String): Int {
-        val raw = args[key]?.jsonPrimitive?.content ?: throw IllegalArgumentException("$key 必填")
+        val raw = optionalStringArg(args, key) ?: throw IllegalArgumentException("$key 必填")
         val value = raw.toIntOrNull() ?: throw IllegalArgumentException("$key 必须是正整数,实际「$raw」")
         if (value <= 0) throw IllegalArgumentException("$key 必须是正整数,实际 $value")
         return value
-    }
-
-    private fun day(args: JsonObject, key: String): LocalDate = parseDay(key, requireRaw(args, key))
-
-    private fun optionalDay(args: JsonObject, key: String): LocalDate? =
-        args[key]?.jsonPrimitive?.content?.let { parseDay(key, it) }
-
-    private fun requireRaw(args: JsonObject, key: String): String =
-        args[key]?.jsonPrimitive?.content ?: throw IllegalArgumentException("$key 必填")
-
-    private fun parseDay(key: String, raw: String): LocalDate = try {
-        LocalDate.parse(raw)
-    } catch (invalid: DateTimeParseException) {
-        throw IllegalArgumentException("$key 需要 YYYY-MM-DD 格式,实际「$raw」", invalid)
-    }
-
-    private fun cadenceArg(args: JsonObject): GoalCadence {
-        val raw = requireRaw(args, "cadence")
-        return GoalCadence.entries.firstOrNull { it.name == raw }
-            ?: throw IllegalArgumentException("cadence 必须是 $CADENCE_CHOICES,实际「$raw」")
     }
 
     companion object {
@@ -344,10 +312,9 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
 
         val ACTION_CHOICES = ACTIONS.joinToString("/")
 
-        /** 周期取值的单一事实来源:与只读工具的 cadence 描述同一套口径。 */
-        val CADENCE_CHOICES = GoalCadence.entries.joinToString("/") { it.name }
-
+        private const val KEY_ACTION = "action"
         private const val KEY_TARGET_ID = "targetId"
+        private const val KEY_CADENCE = "cadence"
         private const val KEY_TARGET_MINUTES = "targetMinutes"
         private const val KEY_STAGE_ID = "stageId"
         private const val KEY_START_DATE = "startDate"

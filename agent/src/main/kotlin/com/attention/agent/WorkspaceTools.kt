@@ -2,13 +2,10 @@ package com.attention.agent
 
 import com.attention.domain.ActiveTimer
 import com.attention.domain.AttentionState
-import com.attention.domain.GoalCadence
-import com.attention.domain.GoalSummary
 import com.attention.domain.ScheduleEntry
 import com.attention.domain.agendaTimeline
 import com.attention.domain.capacitySummary
 import com.attention.domain.elapsedMillis
-import com.attention.domain.goalSummary
 import com.attention.domain.periodStats
 import com.attention.domain.planningDate
 import com.attention.domain.timingScheduleEntryId
@@ -16,12 +13,10 @@ import com.attention.domain.timerTargetLabel
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
-import java.time.format.DateTimeParseException
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonObjectBuilder
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.jsonPrimitive
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
@@ -47,6 +42,8 @@ fun interface WorkspaceSource {
  * 每个工具都是 [AttentionState] 的纯投影——这里只做读取与组装，不新增领域知识，
  * 领域规则全部仍在 `:domain` 的 read-model 函数里。工具不修改任何状态；
  * 变更类动作属于后续阶段（需要确认机制与危险操作基线），不从这里扩展。
+ * 参数解析助手（日期/周期/必填串，见 ToolArgs.kt）与目标条目投影（targetEntry）
+ * 与变更工具共用同一份实现，口径不分家。
  */
 class WorkspaceTools(private val source: WorkspaceSource) {
 
@@ -61,15 +58,7 @@ class WorkspaceTools(private val source: WorkspaceSource) {
             val view = source.snapshot()
             return buildJsonObject {
                 putJsonArray("targets") {
-                    view.state.targets.forEach { target ->
-                        add(buildJsonObject {
-                            put("id", target.id)
-                            put("title", target.title)
-                            target.parentId?.let { put("parentId", it) }
-                            put("archived", target.archived)
-                            putSummary(view.state.goalSummary(target.id, view.planningDay))
-                        })
-                    }
+                    view.state.targets.forEach { add(view.state.targetEntry(it, view.planningDay)) }
                 }
                 put("count", view.state.targets.size)
             }
@@ -91,7 +80,7 @@ class WorkspaceTools(private val source: WorkspaceSource) {
 
         override fun execute(args: JsonObject): JsonObject {
             val view = source.snapshot()
-            val day = optionalDay(args, view)
+            val day = optionalDayArg(args, "planningDate") ?: view.planningDay
             val timeline = view.state.agendaTimeline(day)
             val capacity = view.state.capacitySummary(day.toString())
             return buildJsonObject {
@@ -129,7 +118,7 @@ class WorkspaceTools(private val source: WorkspaceSource) {
         override fun execute(args: JsonObject): JsonObject {
             val view = source.snapshot()
             val cadence = cadenceArg(args)
-            val stats = view.state.periodStats(optionalDay(args, view), cadence)
+            val stats = view.state.periodStats(optionalDayArg(args, "date") ?: view.planningDay, cadence)
             val titles = view.state.targets.associate { it.id to it.title }
             return buildJsonObject {
                 put("cadence", cadence.name)
@@ -177,13 +166,6 @@ class WorkspaceTools(private val source: WorkspaceSource) {
         }
     }
 
-    private fun JsonObjectBuilder.putSummary(summary: GoalSummary) {
-        put("targetMinutes", summary.targetMinutes)
-        put("actualMinutes", summary.actualMinutes)
-        put("gapMinutes", summary.gapMinutes)
-        put("completed", summary.completed)
-    }
-
     private fun entryJson(view: WorkspaceView, entry: ScheduleEntry) = buildJsonObject {
         put("id", entry.id)
         put("title", entry.title)
@@ -193,27 +175,5 @@ class WorkspaceTools(private val source: WorkspaceSource) {
         entry.targetId?.let { put("targetId", it) }
         put("completed", entry.completed)
         if (view.state.timingScheduleEntryId() == entry.id) put("running", true)
-    }
-
-    /** 读取可选的 YYYY-MM-DD 参数；格式不对直接抛，由循环转成错误观测教给推理器。 */
-    private fun optionalDay(args: JsonObject, view: WorkspaceView): LocalDate {
-        val raw = args["planningDate"]?.jsonPrimitive?.content ?: return view.planningDay
-        return try {
-            LocalDate.parse(raw)
-        } catch (invalid: DateTimeParseException) {
-            throw IllegalArgumentException("planningDate 需要 YYYY-MM-DD 格式，实际「$raw」", invalid)
-        }
-    }
-
-    private fun cadenceArg(args: JsonObject): GoalCadence {
-        val raw = args["cadence"]?.jsonPrimitive?.content
-            ?: throw IllegalArgumentException("cadence 必填：$CADENCE_CHOICES")
-        return GoalCadence.entries.firstOrNull { it.name == raw }
-            ?: throw IllegalArgumentException("cadence 必须是 $CADENCE_CHOICES，实际「$raw」")
-    }
-
-    private companion object {
-        /** 周期取值的单一事实来源：schema 描述与两处报错共用，永不与 [GoalCadence] 漂移。 */
-        val CADENCE_CHOICES = GoalCadence.entries.joinToString("/") { it.name }
     }
 }

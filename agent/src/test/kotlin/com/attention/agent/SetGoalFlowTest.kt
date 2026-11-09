@@ -1,7 +1,6 @@
 package com.attention.agent
 
 import com.attention.domain.AttentionCommand
-import com.attention.domain.AttentionCommandResult
 import com.attention.domain.AttentionState
 import com.attention.domain.FutureGoalRule
 import com.attention.domain.GoalCadence
@@ -9,8 +8,6 @@ import com.attention.domain.GoalStage
 import com.attention.domain.Migration
 import com.attention.domain.Target
 import com.attention.domain.addTimeEntry
-import java.time.Instant
-import java.time.ZoneId
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.jsonPrimitive
@@ -24,7 +21,7 @@ import org.junit.Test
  * set_goal 工具在最高接缝(ReActAgent.run)上的全链路语义:
  * 自动级 action 恰好派发一次正确的 command、观测回填、循环继续至答复;
  * 确认级 action 请求即短路,确认后经同一执行通道恰好派发一次,拒绝则零派发;
- * 未知 id 在解析相位转为错误观测回填,零派发。
+ * 未知 id 在解析相位转为错误观测回填,零派发;降级开关关闭时确认级整体不可达。
  */
 class SetGoalFlowTest {
 
@@ -40,21 +37,6 @@ class SetGoalFlowTest {
     private fun achievedState() = baseState().addTimeEntry("2026-03-01", 30, "flow-target")
 
     private fun sourceOf(state: AttentionState) = WorkspaceSource { WorkspaceView(state, DISPATCH_NOW, DISPATCH_ZONE) }
-
-    /** 真执行领域 command 的执行通道:观测投影读到的是执行后的真实状态。 */
-    private class ExecutingExecutor(private val state: AttentionState) : CommandExecutor {
-        val commands = mutableListOf<AttentionCommand>()
-        val nows = mutableListOf<Instant>()
-        val zones = mutableListOf<ZoneId>()
-        val dispatchCount: Int get() = commands.size
-
-        override suspend fun execute(command: AttentionCommand, now: Instant, zone: ZoneId): AttentionCommandResult {
-            commands += command
-            nows += now
-            zones += zone
-            return command.execute(state, now, zone)
-        }
-    }
 
     private fun catalog(tool: ChangeTool, executor: CommandExecutor, gate: ConfirmationGate? = null) = ToolCatalog(
         changeTools = listOf(tool),
@@ -290,6 +272,37 @@ class SetGoalFlowTest {
         val observation = reasoner.histories[1].last() as AgentEvent.Observation
         assertTrue(observation.isError)
         assertTrue(observation.payload["error"]?.jsonPrimitive?.content?.contains("未来目标规则不存在") == true)
+        assertEquals(0, executor.dispatchCount)
+    }
+
+    @Test
+    fun a_confirmation_action_with_the_switch_off_becomes_an_error_observation_without_a_token_or_dispatch() = runTest {
+        val state = baseState()
+        val executor = ExecutingExecutor(state)
+        val gate = ConfirmationGate(executor, clock)
+        val tool = SetGoalTool(sourceOf(state))
+        val args = buildJsonObject {
+            put("action", "add_future_rule")
+            put("targetId", "flow-target")
+            put("cadence", "WEEKLY")
+            put("targetMinutes", 45)
+            put("effectiveFrom", "2026-03-07")
+        }
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("安排未来的目标", ActionRequest("set_goal", args)),
+            ReasonerDecision.Answer(null, "需要确认的操作暂时不可用"),
+        )
+
+        val outcome = ReActAgent(
+            reasoner,
+            ToolCatalog(changeTools = listOf(tool), executor = executor, clock = clock, gate = gate, confirmationEnabled = false),
+        ).run("从下周起把阅读提到每周 45 分钟")
+
+        // 降级开关关闭:确认级动作整体不可达——错误观测回填,不铸令牌、不派发,绝不静默转自动
+        assertEquals("需要确认的操作暂时不可用", (outcome as AgentOutcome.Answered).text)
+        val observation = reasoner.histories[1].last() as AgentEvent.Observation
+        assertTrue(observation.isError)
+        assertTrue(observation.payload["error"]?.jsonPrimitive?.content?.contains("需确认操作暂不可用") == true)
         assertEquals(0, executor.dispatchCount)
     }
 }

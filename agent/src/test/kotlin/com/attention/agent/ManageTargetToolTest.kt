@@ -6,6 +6,7 @@ import com.attention.domain.AttentionState
 import com.attention.domain.addFutureTargetMove
 import com.attention.domain.addTarget
 import com.attention.domain.archiveTarget
+import com.attention.domain.moveTarget
 import java.time.LocalDate
 import kotlinx.coroutines.test.runTest
 import kotlinx.serialization.encodeToString
@@ -27,8 +28,9 @@ import org.junit.Test
 /**
  * manage_target 工具(P1.1 #241)的外部行为:每个 action 的 args → 风险级别、领域
  * command 字段、观测形状三段映射;schema 可解析且字段描述齐;解析相预校验把未知
- * 目标/移动 id 与参数不合法挡在派发之前。循环级全链路(auto 全链路、确认流、
- * 错误观测零派发、无 Forbidden 断言)在同一文件后半部,均在最高接缝上验证。
+ * 目标/移动 id、归档态不匹配与参数不合法挡在派发之前。循环级全链路(auto 全链路、
+ * 确认流、错误观测零派发、降级开关、无 Forbidden 断言)在同一文件后半部,均在最高
+ * 接缝上验证。
  */
 class ManageTargetToolTest {
     private val clock = ChangeClockSource { ChangeClock(DISPATCH_NOW, DISPATCH_ZONE) }
@@ -39,17 +41,30 @@ class ManageTargetToolTest {
 
     private fun stateOf(vararg titles: String): AttentionState = titles.fold(AttentionState()) { state, title -> state.addTarget(title) }
 
-    /** 与工具实现相互独立的条目字面量:观测形状的期望以这里编码的为准。 */
+    /**
+     * 与工具实现相互独立的条目字面量:观测形状的期望以这里编码的为准。
+     * 表内 fixture 均无目标阶段,进度汇总四元读数为零;字段集与 query_targets 对齐。
+     */
     private fun entry(id: String, title: String, parentId: String?, archived: Boolean = false): JsonObject = buildJsonObject {
         put("id", id)
         put("title", title)
         parentId?.let { put("parentId", it) }
         put("archived", archived)
+        put("targetMinutes", 0)
+        put("actualMinutes", 0)
+        put("gapMinutes", 0)
+        put("completed", false)
     }
 
-    private fun observation(vararg targets: JsonObject, targetMove: JsonObject? = null, cancelledMoveId: String? = null): JsonObject =
+    private fun observation(
+        vararg targets: JsonObject,
+        oldParentId: String? = null,
+        targetMove: JsonObject? = null,
+        cancelledMoveId: String? = null,
+    ): JsonObject =
         buildJsonObject {
             putJsonArray("targets") { targets.forEach { add(it) } }
+            oldParentId?.let { put("oldParentId", it) }
             targetMove?.let { put("targetMove", it) }
             cancelledMoveId?.let { put("cancelledMoveId", it) }
         }
@@ -116,7 +131,7 @@ class ManageTargetToolTest {
                 buildJsonObject { put("action", "move"); put("targetId", child.id); put("newParentId", study.id) },
                 RiskLevel.Confirmation,
                 AttentionCommand.MoveTarget(child.id, study.id),
-                { observation(entry(child.id, "孩子", study.id), entry(study.id, "学习", null)) },
+                { observation(entry(child.id, "孩子", study.id), entry(study.id, "学习", null), oldParentId = work.id) },
             ),
             Row(
                 "schedule_move", withChild,
@@ -403,9 +418,73 @@ class ManageTargetToolTest {
         ).run("归档它")
 
         // 拒绝后数据保持原样:零派发,令牌一次性消费
-        assertEquals(ConfirmationResolution.Cancelled, gate.cancel((outcome as AgentOutcome.PendingConfirmation).token))
+        val pending = outcome as AgentOutcome.PendingConfirmation
+        assertEquals(ConfirmationResolution.Cancelled, gate.cancel(pending.token))
         assertEquals(0, executor.dispatchCount)
-        assertEquals(ConfirmationResolution.AlreadyResolved, gate.confirm((outcome as AgentOutcome.PendingConfirmation).token))
+        assertEquals(ConfirmationResolution.AlreadyResolved, gate.confirm(pending.token))
+        assertEquals(0, executor.dispatchCount)
+    }
+
+    @Test
+    fun archive_and_restore_prevalidate_the_archived_state_in_the_parse_phase() {
+        val base = stateOf("工作")
+        val work = base.targets.single()
+        val archived = base.archiveTarget(work.id)
+
+        assertThrows("归档已归档目标应在解析相位失败", IllegalArgumentException::class.java) {
+            toolOf(archived).command(buildJsonObject { put("action", "archive"); put("targetId", work.id) })
+        }
+        assertThrows("恢复未归档目标应在解析相位失败", IllegalArgumentException::class.java) {
+            toolOf(base).command(buildJsonObject { put("action", "restore"); putJsonArray("targetIds") { add(JsonPrimitive(work.id)) } })
+        }
+    }
+
+    @Test
+    fun move_observation_reports_the_old_parent_from_the_parse_phase_snapshot() {
+        val base = stateOf("工作", "学习")
+        val work = base.targets[0]
+        val study = base.targets[1]
+        val withChild = base.addTarget("孩子", work.id)
+        val child = withChild.targets.last()
+        var current = withChild
+        val tool = ManageTargetTool(WorkspaceSource { WorkspaceView(current, DISPATCH_NOW, DISPATCH_ZONE) })
+        val args = buildJsonObject { put("action", "move"); put("targetId", child.id); put("newParentId", study.id) }
+        tool.command(args)
+
+        // 观测相的快照已是换父后的世界:旧父在那里已查不到,回执仍取解析相的派发前快照
+        current = current.moveTarget(child.id, study.id)
+        val observation = tool.observation(args, AttentionCommandResult(current))
+
+        assertEquals(work.id, observation["oldParentId"]?.jsonPrimitive?.content)
+    }
+
+    @Test
+    fun a_confirmation_action_with_the_switch_off_becomes_an_error_observation_without_a_token_or_dispatch() = runTest {
+        val fixture = stateOf("工作")
+        val args = buildJsonObject { put("action", "archive"); put("targetId", fixture.targets.single().id) }
+        val executor = FakeCommandExecutor()
+        val gate = ConfirmationGate(executor, clock)
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求归档", ActionRequest("manage_target", args)),
+            ReasonerDecision.Answer(null, "需要确认的操作暂时不可用"),
+        )
+
+        val outcome = ReActAgent(
+            reasoner,
+            ToolCatalog(
+                changeTools = listOf(toolOf(fixture)),
+                executor = executor,
+                clock = clock,
+                gate = gate,
+                confirmationEnabled = false,
+            ),
+        ).run("归档它")
+
+        // 降级开关关闭:确认级动作整体不可达——错误观测回填,不铸令牌、不派发,绝不静默转自动
+        assertEquals("需要确认的操作暂时不可用", (outcome as AgentOutcome.Answered).text)
+        val observation = reasoner.histories[1].last() as AgentEvent.Observation
+        assertTrue(observation.isError)
+        assertTrue(observation.payload["error"]?.jsonPrimitive?.content?.contains("需确认操作暂不可用") == true)
         assertEquals(0, executor.dispatchCount)
     }
 }

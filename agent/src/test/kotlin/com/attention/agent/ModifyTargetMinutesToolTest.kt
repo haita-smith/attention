@@ -84,6 +84,17 @@ class ModifyTargetMinutesToolTest {
     }
 
     @Test
+    fun a_one_time_stage_is_rejected_in_the_parse_phase() {
+        // 一次性阶段没有下一周期边界,引擎的 updateGoalStage 必然拒绝;解析相提前拒绝,
+        // 不让用户确认一个注定失败的操作(引擎仍是权威,这里只是同口径的预校验)
+        val oneTime = baseState(GoalStage("modify-stage", "goal-target", GoalCadence.ONE_TIME, 100, "2026-10-05"))
+        val thrown = assertThrows("一次性阶段应在解析相位失败", IllegalArgumentException::class.java) {
+            tool(oneTime).command(args())
+        }
+        assertTrue("报错应可指导纠正", thrown.message?.contains("一次性阶段") == true)
+    }
+
+    @Test
     fun observation_projects_the_affected_target_like_every_other_action() {
         val tool = tool()
         val executed = AttentionCommand.UpdateGoalStage(stageId = "modify-stage", targetMinutes = 50)
