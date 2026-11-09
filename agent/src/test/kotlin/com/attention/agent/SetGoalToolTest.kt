@@ -349,8 +349,8 @@ class SetGoalToolTest {
     @Test
     fun an_unknown_action_is_rejected_before_any_risk_is_decided() {
         val tool = tool()
-        // modify_target_minutes 属 P1.3,本票工具不得识别;删除类动作名同样不可达
-        listOf("delete_stage", "delete_rule", "delete_migration", "clear_stages", "modify_target_minutes", "rename").forEach { action ->
+        // 删除类动作名不可达:P1.3 起 modify_target_minutes 已入列,见 ModifyTargetMinutesToolTest
+        listOf("delete_stage", "delete_rule", "delete_migration", "clear_stages", "rename").forEach { action ->
             assertThrows("未知 action「$action」应被拒", IllegalArgumentException::class.java) {
                 tool.riskLevel(buildJsonObject { put("action", action) })
             }
@@ -359,12 +359,14 @@ class SetGoalToolTest {
     }
 
     @Test
-    fun the_action_set_is_exactly_eight_goal_actions_and_declares_no_forbidden_level() {
-        // 字面量清单是独立事实源:动作全集恰好 8 个,不含任何删除/清空类 action
+    fun the_action_set_is_exactly_nine_goal_actions_and_declares_no_forbidden_level() {
+        // 字面量清单是独立事实源:动作全集恰好 9 个(P1.3 增补 modify_target_minutes),
+        // 不含任何删除/清空类 action
         assertEquals(
             setOf(
                 "add_stage",
                 "append_one_time_stage",
+                "modify_target_minutes",
                 "add_future_rule",
                 "update_future_rule",
                 "cancel_future_rule",

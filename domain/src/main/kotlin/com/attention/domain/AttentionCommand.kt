@@ -395,6 +395,24 @@ sealed interface AttentionCommand {
         override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
             AttentionCommandResult(state.cancelMigration(migrationId))
     }
+
+    // ---- 修改时间目标 command(P1.3 #243)----
+    // 唯一的非薄包装领域规则(updateGoalStage)的通道:生效点、去重更新、completed
+    // 与一次性阶段拒绝等规则全部在引擎函数内,command 只折算当前规划日作为 notBefore。
+
+    /**
+     * 修改一个已生效目标阶段的目标分钟数与可选截止日(需确认):经未来规则 overlay
+     * 落地,生效点为该阶段周期粒度下、从当前规划日推算的下一个周期边界;
+     * 当前周期与一切已结算历史不被改写。规则见 [AttentionState.updateGoalStage]。
+     */
+    data class UpdateGoalStage(
+        val stageId: String,
+        val targetMinutes: Int,
+        val dueDate: String? = null,
+    ) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.updateGoalStage(stageId, targetMinutes, dueDate, state.planningDate(now, zone)))
+    }
 }
 
 /** Result returned by every [AttentionCommand]. */
