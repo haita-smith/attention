@@ -1,5 +1,6 @@
 package com.attention.app.agent
 
+import com.attention.agent.CommandExecutor
 import com.attention.app.data.AttentionStateRepository
 import com.attention.app.data.audit.AgentTraceEntry
 import com.attention.app.data.audit.AiChangeAudit
@@ -67,13 +68,29 @@ class WorkspaceAgentWiringBoundaryTest {
         val snapshots = RecordingSnapshotStore()
         val traces = RecordingTraceStore()
         val repository = FakeAttentionStateRepository()
+        // 驱动真实写入点:仓库派发通道经审计门面包装,与生产装配同构(一行委托适配)。
+        // 结构不变式:ViewModel 与计时服务持有裸仓库,手动派发在类型上就不经包装;
+        // 包装 executor 仅运行时持有,是唯一触达审计的通道。
+        val audited = AuditedCommandExecutor(
+            delegate = CommandExecutor { command, now, zone -> repository.executeCommand(command, now, zone) },
+            audit = AiChangeAudit(traces, snapshots),
+            currentState = { AttentionState() },
+        )
 
-        // 手动路径:与 ViewModel/计时服务同一通道,直接经仓库派发,不经任何包装
+        // 手动口径:直接调仓库,不经任何包装
         repository.executeCommand(AttentionCommand.StopTimer, DISPATCH_NOW, DISPATCH_ZONE)
 
         assertEquals(1, repository.dispatched.size)
         assertEquals("手动派发不得触发快照", emptyList<AttentionState>(), snapshots.captured)
         assertEquals("手动派发不得写运行摘要", emptyList<AgentTraceEntry>(), traces.recorded)
+
+        // AI 口径对照面:同一条 command 经包装 executor,派发前快照与运行名单必须发生——
+        // 证明上面的零审计是路径差异,不是替身恒真
+        audited.beginRun()
+        audited.execute(AttentionCommand.StopTimer, DISPATCH_NOW, DISPATCH_ZONE)
+
+        assertEquals("AI 派发须先写快照", listOf(AttentionState()), snapshots.captured)
+        assertEquals("AI 派发入运行名单", listOf("StopTimer"), audited.finishRun())
     }
 
     @Test

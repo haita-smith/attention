@@ -111,19 +111,22 @@ class WorkspaceAgentRuntime(
      * 跑一次助手请求:请求进,领域终态出。运行结束把边界内收集的领域 command
      * 简单类名与映射后的结局写入审计摘要;待确认终态短路收敛、不经映射,
      * 摘要随确认线的扩展再补(裁决可能让同一令牌最终派发,口径不能提前定)。
+     *
+     * 收账只有唯一出口:边界关闭与摘要写入都在出口处一次性结算,名单只取一次,
+     * 正确性不依赖重复收尾的幂等。[agent.run] 仅在取消时抛出,此时终态缺席、
+     * 只关边界不记账。
      */
     suspend fun run(request: String): AgentOutcome = runMutex.withLock {
         executor.beginRun()
+        var finished: AgentOutcome? = null
         try {
-            when (val outcome = agent.run(request)) {
-                is AgentOutcome.PendingConfirmation -> outcome
-                else -> {
-                    audit.recordRun(request, outcome.toAgentRunOutcome(), executor.finishRun())
-                    outcome
-                }
-            }
+            agent.run(request).also { finished = it }
         } finally {
-            executor.finishRun()
+            val outcome = finished
+            val commands = executor.finishRun()
+            if (outcome != null && outcome !is AgentOutcome.PendingConfirmation) {
+                audit.recordRun(request, outcome.toAgentRunOutcome(), commands)
+            }
         }
     }
 

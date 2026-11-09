@@ -88,6 +88,27 @@ class WorkspaceAgentRuntimeTest {
     }
 
     @Test
+    fun consecutive_runs_settle_their_boundary_exactly_once_with_their_own_commands() = runBlocking {
+        val traces = RecordingTraceStore()
+        val tool = ScriptedChangeTool(commandQueue = ArrayDeque(List(2) { AttentionCommand.StopTimer }))
+        val reasoner = ScriptedReasoner(
+            ReasonerDecision.Act("第一笔", ActionRequest("scripted_change")),
+            ReasonerDecision.Answer.withoutThought("第一次完成"),
+            ReasonerDecision.Act("第二笔", ActionRequest("scripted_change")),
+            ReasonerDecision.Answer.withoutThought("第二次完成"),
+        )
+        val agentRuntime = runtime(reasoner, traces = traces, changeTools = listOf(tool))
+
+        agentRuntime.run("第一次请求")
+        agentRuntime.run("第二次请求")
+
+        // 收账在唯一出口一次性结算:每次运行恰一条摘要,名单只含自己边界内的派发,
+        // 上一边界的关闭不滚入下一次,收尾也不重复记账
+        assertEquals(listOf("第一次请求", "第二次请求"), traces.recorded.map { it.request })
+        assertEquals(listOf(listOf("StopTimer"), listOf("StopTimer")), traces.recorded.map { it.commands })
+    }
+
+    @Test
     fun a_budget_exhausted_run_maps_to_budget_exhausted() = runBlocking {
         val traces = RecordingTraceStore()
         val tool = ScriptedChangeTool()
