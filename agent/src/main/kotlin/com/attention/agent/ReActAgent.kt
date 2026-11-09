@@ -1,8 +1,6 @@
 package com.attention.agent
 
 import java.util.concurrent.CancellationException
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 
 // JVM 上 kotlinx.coroutines.CancellationException 就是本文件导入的 JDK 类型的别名：
 // 捕获它即可接住协程取消，又不必让纯投影模块拉进 coroutines 依赖（与 :domain/:workspace-state 一致）。
@@ -27,7 +25,9 @@ class ReActAgent(
     /**
      * 跑一次循环。除协程取消外不抛任何异常：推理器自身失败收敛为
      * [AgentOutcome.Failed]；工具侧的一切失败（未知工具、参数不合法、执行异常）
-     * 都收敛为带 isError 的观测回填给推理器，由它决定纠正、换路还是直接答复。
+     * 都收敛为带 isError 的观测回填给推理器，由它决定纠正、换路还是直接答复；
+     * 只有变更执行通道（[CommandExecutor]）的故障直接收敛为 [AgentOutcome.Failed]——
+     * 那不是推理器换个问法能修复的。
      */
     suspend fun run(request: String): AgentOutcome {
         val trace = mutableListOf<AgentEvent>()
@@ -37,12 +37,21 @@ class ReActAgent(
             } catch (cancelled: CancellationException) {
                 throw cancelled
             } catch (failure: Throwable) {
-                return AgentOutcome.Failed(describe(failure), trace)
+                return AgentOutcome.Failed(describeFailure(failure), trace)
             }
             when (decision) {
                 is ReasonerDecision.Act -> {
                     trace += AgentEvent.Thought(decision.thought)
-                    trace += actionEvents(decision.action)
+                    when (val execution = executeAction(decision.action)) {
+                        is ToolExecution.Observed -> {
+                            trace += AgentEvent.Action(decision.action.tool, decision.action.args)
+                            trace += execution.observation
+                        }
+                        is ToolExecution.DispatchFailed -> {
+                            trace += AgentEvent.Action(decision.action.tool, decision.action.args)
+                            return AgentOutcome.Failed(execution.reason, trace)
+                        }
+                    }
                 }
                 is ReasonerDecision.Answer -> {
                     decision.thought?.let { trace += AgentEvent.Thought(it) }
@@ -54,28 +63,15 @@ class ReActAgent(
         return AgentOutcome.BudgetExhausted(trace)
     }
 
-    /** 一次行动 = 一条行动事件加一条观测事件；观测来自工具执行。 */
-    private fun actionEvents(action: ActionRequest): List<AgentEvent> =
-        listOf(AgentEvent.Action(action.tool, action.args), observe(action))
-
-    /** 工具侧失败不是循环的失败：统一转成错误观测，让推理器看到原因并自行纠正。 */
-    private fun observe(action: ActionRequest): AgentEvent.Observation {
-        val tool = tools[action.tool] ?: return errorObservation("未知工具：${action.tool}")
-        return try {
-            AgentEvent.Observation(tool.execute(action.args))
+    /** 一次行动统一经目录挂起执行；工具侧的一切失败在这里收敛为错误观测（协程取消除外）。 */
+    private suspend fun executeAction(action: ActionRequest): ToolExecution =
+        try {
+            tools.execute(action.tool, action.args)
         } catch (cancelled: CancellationException) {
             throw cancelled
         } catch (failure: Throwable) {
-            errorObservation(describe(failure))
+            ToolExecution.Observed(errorObservation(describeFailure(failure)))
         }
-    }
-
-    private fun errorObservation(message: String): AgentEvent.Observation =
-        AgentEvent.Observation(buildJsonObject { put("error", message) }, isError = true)
-
-    /** 异常给推理器看的是人话：有消息用消息，没有消息退到异常类名。 */
-    private fun describe(failure: Throwable): String =
-        failure.message ?: failure::class.java.simpleName
 
     companion object {
         const val DEFAULT_MAX_STEPS = 8
