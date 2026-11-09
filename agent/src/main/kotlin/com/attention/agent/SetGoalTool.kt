@@ -20,16 +20,16 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 
 /**
- * 目标设定工具:set_goal 一个意图、八个 action,按 action 静态分级。
- * 阶段追加(含一次性追加)是低风险整理,自动执行;未来规则与目标迁移的增改停
- * 决定「未来的目标承诺」,未经用户确认不得派发。动作全集不含任何删除/清空类
- * action(迁移与未生效规则的取消是标记或移除待生效意图,不是历史删除),
- * 也不声明 [RiskLevel.Forbidden]——永禁操作根本没有 command 通道。
+ * 目标设定工具:set_goal 一个意图、九个 action,按 action 静态分级。
+ * 阶段追加(含一次性追加)是低风险整理,自动执行;修改已生效阶段的时间目标、
+ * 未来规则与目标迁移的增改停决定「未来的目标承诺」,未经用户确认不得派发。
+ * 动作全集不含任何删除/清空类 action(迁移与未生效规则的取消是标记或移除待生效
+ * 意图,不是历史删除),也不声明 [RiskLevel.Forbidden]——永禁操作根本没有 command 通道。
  *
- * 解析相位以 [WorkspaceSource] 快照做存在性预校验:未知目标/阶段/规则/迁移 id
- * 在解析时转为错误观测回填,推理器可自行纠正;确认级动作因此不会为无效请求
- * 铸造令牌。预校验只钉存在性与归属,领域规则(生效日约束、可用缺口分钟)仍由
- * `:domain` 的 command 在执行期治理。
+ * 解析相位以 [WorkspaceSource] 快照做存在性预校验:未知目标/阶段/规则/迁移 id、
+ * 已完成阶段在解析时转为错误观测回填,推理器可自行纠正;确认级动作因此不会为
+ * 无效请求铸造令牌。预校验只钉存在性、归属与完成态,领域规则(生效点边界、
+ * 去重更新、一次性阶段拒绝)仍由 `:domain` 的 command 在执行期治理。
  *
  * 观测投影对齐 query_targets 先例:扁平目标条目 + 进度汇总,缺省字段不写,
  * 只含受影响目标,不回显全量状态。
@@ -38,7 +38,7 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
 
     override val name = "set_goal"
 
-    override val description = "设定目标:追加周期阶段或一次性阶段(自动),安排、修改或取消未来的目标规则与目标迁移(需确认)"
+    override val description = "设定目标:追加周期阶段或一次性阶段(自动);修改已生效阶段的时间目标、安排、修改或取消未来的目标规则与目标迁移(需确认)"
 
     override val riskLevels = setOf(RiskLevel.Auto, RiskLevel.Confirmation)
 
@@ -60,7 +60,8 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
             putJsonObject("startDate") { put("type", "string"); put("description", "阶段开始日,YYYY-MM-DD") }
             putJsonObject("dueDate") { put("type", "string"); put("description", "可选,截止日,YYYY-MM-DD") }
             putJsonObject("stageId") {
-                put("type", "string"); put("description", "可选,未来规则绑定的目标阶段 id;缺省为目标级规则")
+                put("type", "string")
+                put("description", "目标阶段 id:add_future_rule/update_future_rule 缺省为目标级规则;modify_target_minutes 必填,是被修改的阶段")
             }
             putJsonObject("effectiveFrom") {
                 put("type", "string"); put("description", "未来规则生效日,必须晚于当前规划日,YYYY-MM-DD")
@@ -90,6 +91,7 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
         return when (knownAction(args)) {
             ACTION_ADD_STAGE -> parseAddStage(state, args)
             ACTION_APPEND_ONE_TIME_STAGE -> parseAppendOneTimeStage(state, args)
+            ACTION_MODIFY_TARGET_MINUTES -> parseModifyTargetMinutes(state, args)
             ACTION_ADD_FUTURE_RULE -> parseAddFutureRule(state, args)
             ACTION_UPDATE_FUTURE_RULE -> parseUpdateFutureRule(state, args)
             ACTION_CANCEL_FUTURE_RULE -> parseCancelFutureRule(state, args)
@@ -113,6 +115,23 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
     private fun parseAppendOneTimeStage(state: AttentionState, args: JsonObject): AttentionCommand {
         val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
         return AttentionCommand.AppendOneTimeGoalStage(target.id, positiveInt(args, KEY_TARGET_MINUTES))
+    }
+
+    /**
+     * 修改已生效阶段的时间目标:生效点、去重更新与一次性阶段拒绝由引擎治理,
+     * 这里只预校验阶段存在、归属与未完成(工票钉定的解析相位守卫),让确认级
+     * 动作不会为无效请求铸造令牌。
+     */
+    private fun parseModifyTargetMinutes(state: AttentionState, args: JsonObject): AttentionCommand {
+        val target = requireActiveTarget(state, string(args, KEY_TARGET_ID))
+        val stageId = string(args, KEY_STAGE_ID)
+        if (stageId.isBlank()) throw IllegalArgumentException("stageId 必填:modify_target_minutes 修改的是具体阶段")
+        requireModifiableStage(state, target.id, stageId)
+        return AttentionCommand.UpdateGoalStage(
+            stageId = stageId,
+            targetMinutes = positiveInt(args, KEY_TARGET_MINUTES),
+            dueDate = optionalDay(args, KEY_DUE_DATE)?.toString(),
+        )
     }
 
     private fun parseAddFutureRule(state: AttentionState, args: JsonObject): AttentionCommand {
@@ -242,6 +261,14 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
         if (stage.targetId != targetId) throw IllegalArgumentException("目标阶段 $stageId 不属于目标 $targetId")
     }
 
+    /** 修改类动作的预校验:阶段必须存在、属于该目标且未完成——历史承诺不可改写。 */
+    private fun requireModifiableStage(state: AttentionState, targetId: String, stageId: String) {
+        val stage = state.goalStages.firstOrNull { it.id == stageId }
+            ?: throw IllegalArgumentException("目标阶段不存在:$stageId")
+        if (stage.targetId != targetId) throw IllegalArgumentException("目标阶段 $stageId 不属于目标 $targetId")
+        if (stage.completed) throw IllegalArgumentException("目标阶段已完成,不能修改:$stageId")
+    }
+
     private fun requireRuleOfTarget(state: AttentionState, targetId: String, ruleId: String): FutureGoalRule {
         val rule = state.futureGoalRules.firstOrNull { it.id == ruleId }
             ?: throw IllegalArgumentException("未来目标规则不存在:$ruleId")
@@ -294,6 +321,7 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
     companion object {
         const val ACTION_ADD_STAGE = "add_stage"
         const val ACTION_APPEND_ONE_TIME_STAGE = "append_one_time_stage"
+        const val ACTION_MODIFY_TARGET_MINUTES = "modify_target_minutes"
         const val ACTION_ADD_FUTURE_RULE = "add_future_rule"
         const val ACTION_UPDATE_FUTURE_RULE = "update_future_rule"
         const val ACTION_CANCEL_FUTURE_RULE = "cancel_future_rule"
@@ -305,6 +333,7 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
         val ACTIONS = listOf(
             ACTION_ADD_STAGE,
             ACTION_APPEND_ONE_TIME_STAGE,
+            ACTION_MODIFY_TARGET_MINUTES,
             ACTION_ADD_FUTURE_RULE,
             ACTION_UPDATE_FUTURE_RULE,
             ACTION_CANCEL_FUTURE_RULE,
@@ -320,6 +349,7 @@ class SetGoalTool(private val source: WorkspaceSource) : ChangeTool {
 
         private const val KEY_TARGET_ID = "targetId"
         private const val KEY_TARGET_MINUTES = "targetMinutes"
+        private const val KEY_STAGE_ID = "stageId"
         private const val KEY_START_DATE = "startDate"
         private const val KEY_DUE_DATE = "dueDate"
         private const val KEY_EFFECTIVE_FROM = "effectiveFrom"

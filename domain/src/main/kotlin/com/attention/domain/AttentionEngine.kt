@@ -927,6 +927,60 @@ fun AttentionState.cancelFutureGoalRule(ruleId: String, notBefore: LocalDate): A
     return copy(futureGoalRules = futureGoalRules.filterNot { it.id == ruleId })
 }
 
+/**
+ * 修改一个已生效目标阶段的目标分钟数与截止日,经既有未来规则 overlay 落地。
+ *
+ * 生效点是该阶段周期粒度下、从 [notBefore](当前规划日)推算的下一个周期边界:
+ * 当前周期整段仍由开始时的规则治理(周期快照的既述不变式),新承诺从下一周期
+ * 第一天起整体生效,绝不在周期中途改写。overlay 的周期类型取阶段自身的类型,
+ * 使生效边界与 overlay 治理的周期对齐;阶段本体字段保持原样,历史不改写。
+ *
+ * 同一阶段同一生效点的既有待生效 overlay 走更新语义(复用 [updateFutureGoalRule]
+ * 的唯一性与生效界线校验),不重复堆叠;不同生效点的 overlay 各自独立。
+ * 已完成(completed)阶段拒绝修改;一次性阶段的「周期」就是阶段本身,没有下一
+ * 周期边界,overlay 只能把生效起点推到阶段中途、重写当前周期的进度窗口,因此
+ * 结构性拒绝。生效日约束、归档状态等校验由 [addFutureGoalRule]/[updateFutureGoalRule]
+ * 内部给出,此处不复制。
+ */
+fun AttentionState.updateGoalStage(
+    stageId: String,
+    targetMinutes: Int,
+    dueDate: String?,
+    notBefore: LocalDate,
+): AttentionState {
+    val stage = goalStages.firstOrNull { it.id == stageId } ?: error("目标阶段不存在")
+    require(!stage.completed) { "已完成的目标阶段不能修改" }
+    require(targetMinutes > 0) { "目标分钟必须为正整数" }
+    require(stage.cadence != GoalCadence.ONE_TIME) { "一次性阶段没有下一周期边界,不能修改" }
+    val effectiveFrom = nextPeriodBoundary(notBefore, stage.cadence).toString()
+    val existing = futureGoalRules.firstOrNull {
+        it.targetId == stage.targetId && it.stageId.trim().ifBlank { "" } == stage.id && it.effectiveFrom == effectiveFrom
+    }
+    val overlay = FutureGoalRule(
+        id = existing?.id ?: newId(),
+        targetId = stage.targetId,
+        stageId = stage.id,
+        cadence = stage.cadence,
+        targetMinutes = targetMinutes,
+        effectiveFrom = effectiveFrom,
+        dueDate = dueDate,
+    )
+    return if (existing == null) {
+        addFutureGoalRule(overlay, notBefore)
+    } else {
+        updateFutureGoalRule(overlay, notBefore)
+    }
+}
+
+/**
+ * 从 [day] 起按周期粒度定位下一个周期边界:次日本身开启新周期时即次日,
+ * 否则当前周期的结束次日。周期口径与 [periodRange] 同源(含周起始日设置)。
+ */
+private fun AttentionState.nextPeriodBoundary(day: LocalDate, cadence: GoalCadence): LocalDate {
+    val range = periodRange(day.plusDays(1), cadence)
+    return if (range.start.isAfter(day)) range.start else range.endInclusive.plusDays(1)
+}
+
 fun AttentionState.goalRulesAt(targetId: String, onDate: LocalDate): List<FutureGoalRule> = futureGoalRules
     .filter { it.targetId == targetId && !LocalDate.parse(it.effectiveFrom).isAfter(onDate) }
     .sortedWith(compareBy<FutureGoalRule> { LocalDate.parse(it.effectiveFrom) }.thenBy { it.id })
