@@ -252,6 +252,167 @@ sealed interface AttentionCommand {
             return AttentionCommandResult(restored, timeEntries = listOf(entry))
         }
     }
+
+    // ---- 目标树管理 command(P1.1 #241)----
+    //
+    // 本块全部是对既有引擎纯函数的薄包装:规则只活在 AttentionEngine 一处,command
+    // 不复制校验、不改写结果。目标动作不触碰时间记录与里程碑,返回值只带 state;
+    // 未来移动的生效界线一律取执行时刻的规划日(planningDate(now, zone)),与工具
+    // 快照、周期结算对「今天」的理解同源。
+
+    /** 在指定父目标(缺省为根)之下新建一个目标,排在同层末尾。 */
+    data class CreateTarget(val title: String, val parentId: String? = null) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addTarget(title, parentId))
+    }
+
+    /** 重命名一个已有目标;名称必须非空白,目标必须存在。 */
+    data class RenameTarget(val targetId: String, val title: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.renameTarget(targetId, title))
+    }
+
+    /** 把目标在同层内重排到 [newIndex](0 起,越界拒绝)。 */
+    data class ReorderTarget(val targetId: String, val newIndex: Int) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.reorderTarget(targetId, newIndex))
+    }
+
+    /** 展开或折叠一个目标分支;排序与展开折叠是持久化的领域状态,不是纯视图偏好。 */
+    data class SetTargetExpanded(val targetId: String, val expanded: Boolean) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.setTargetExpanded(targetId, expanded))
+    }
+
+    /** 立即换父;防移入自身或后代,自动排到新父末尾(规则在 [AttentionState.moveTarget])。 */
+    data class MoveTarget(val targetId: String, val newParentId: String?) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.moveTarget(targetId, newParentId))
+    }
+
+    /** 安排一次未来生效的换父;生效日必须晚于执行时刻的规划日。 */
+    data class ScheduleTargetMove(val targetId: String, val parentId: String?, val effectiveFrom: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addFutureTargetMove(targetId, parentId, effectiveFrom, state.planningDate(now, zone)))
+    }
+
+    /**
+     * 修改一笔尚未生效的未来移动的父目标与生效日;移动的 id 与所属目标不可改。
+     * 先按 [moveId] 取出既有移动、保持身份字段原样,再交既有领域函数按唯一性与
+     * 生效界线校验更新——查找失败与校验失败都原样上行,不在此翻译或吞并。
+     */
+    data class UpdateTargetMove(val moveId: String, val parentId: String?, val effectiveFrom: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult {
+            val existing = state.targetMoves.firstOrNull { it.id == moveId } ?: error("未来目标移动不存在")
+            val updated = existing.copy(parentId = parentId, effectiveFrom = effectiveFrom)
+            return AttentionCommandResult(state.updateFutureTargetMove(updated, state.planningDate(now, zone)))
+        }
+    }
+
+    /** 取消一笔尚未生效的未来移动;已生效的历史移动不可取消,也不可改写。 */
+    data class CancelTargetMove(val moveId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.cancelFutureTargetMove(moveId, state.planningDate(now, zone)))
+    }
+
+    /** 归档一个目标;指向它的活动计时器置为未归属,时间记录保持原样。 */
+    data class ArchiveTarget(val targetId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.archiveTarget(targetId))
+    }
+
+    /** 恢复若干归档目标,并级联恢复其归档祖先,层级与排序原样保留。 */
+    data class RestoreTargets(val targetIds: Set<String>) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.restoreTargets(targetIds))
+    }
+
+    // ---- 目标设定 command(P1.2 #242)----
+    // set_goal 工具族派发的领域通道:全部是对既有引擎纯函数的薄包装,不复制任何领域规则,
+    // 校验(归档状态、生效日约束、可用迁移分钟)都由引擎函数内部给出。目标动作不产时间
+    // 记录与里程碑,返回值只带 state。「当前规划日」一律由 command 的 (now, zone) 显式
+    // 折算(ADR-0005),不读系统时钟,测试与备份重放因此可以固定。
+
+    /** 给未归档目标追加一个周期阶段;正数分钟、一次性唯一与截止约束由引擎治理。 */
+    data class AddGoalStage(
+        val targetId: String,
+        val cadence: GoalCadence,
+        val targetMinutes: Int,
+        val startDate: String,
+        val dueDate: String? = null,
+    ) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addGoalStage(targetId, cadence, targetMinutes, startDate, dueDate))
+    }
+
+    /**
+     * 在已达成的一次性阶段之后追加新的一次性阶段。
+     * 新阶段的开始日取当前规划日——「接着上一个阶段继续」的语义里,用户说追加时
+     * 指的就是从现在开始;上一阶段是否达成由引擎在引擎侧校验。
+     */
+    data class AppendOneTimeGoalStage(
+        val targetId: String,
+        val targetMinutes: Int,
+    ) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(
+                state.appendOneTimeGoalStage(targetId, targetMinutes, state.planningDate(now, zone).toString()),
+            )
+    }
+
+    /** 登记一条未来目标规则;notBefore 取当前规划日,「必须从未来生效」由引擎治理。 */
+    data class AddFutureGoalRule(val rule: FutureGoalRule) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addFutureGoalRule(rule, state.planningDate(now, zone)))
+    }
+
+    /** 更新一条尚未生效的未来目标规则;目标与阶段不可改、已生效即拒改由引擎治理。 */
+    data class UpdateFutureGoalRule(val rule: FutureGoalRule) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.updateFutureGoalRule(rule, state.planningDate(now, zone)))
+    }
+
+    /** 取消(移除)一条尚未生效的未来目标规则;已生效即拒取消由引擎治理。 */
+    data class CancelFutureGoalRule(val ruleId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.cancelFutureGoalRule(ruleId, state.planningDate(now, zone)))
+    }
+
+    /** 登记一笔目标迁移;onDate 取当前规划日,去向生效窗口与可用缺口分钟由引擎治理。 */
+    data class AddMigration(val migration: Migration) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addMigration(migration, state.planningDate(now, zone)))
+    }
+
+    /** 原地更新一笔未取消的迁移;可用缺口按移除旧账后的现状由引擎重算。 */
+    data class UpdateMigration(val migration: Migration) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.updateMigration(migration, state.planningDate(now, zone)))
+    }
+
+    /** 取消一笔迁移:标记 cancelled 而非删除,迁移历史保持可追溯。 */
+    data class CancelMigration(val migrationId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.cancelMigration(migrationId))
+    }
+
+    // ---- 修改时间目标 command(P1.3 #243)----
+    // 唯一的非薄包装领域规则(updateGoalStage)的通道:生效点、去重更新、completed
+    // 与一次性阶段拒绝等规则全部在引擎函数内,command 只折算当前规划日作为 notBefore。
+
+    /**
+     * 修改一个已生效目标阶段的目标分钟数与可选截止日(需确认):经未来规则 overlay
+     * 落地,生效点为该阶段周期粒度下、从当前规划日推算的下一个周期边界;
+     * 当前周期与一切已结算历史不被改写。规则见 [AttentionState.updateGoalStage]。
+     */
+    data class UpdateGoalStage(
+        val stageId: String,
+        val targetMinutes: Int,
+        val dueDate: String? = null,
+    ) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.updateGoalStage(stageId, targetMinutes, dueDate, state.planningDate(now, zone)))
+    }
 }
 
 /** Result returned by every [AttentionCommand]. */
