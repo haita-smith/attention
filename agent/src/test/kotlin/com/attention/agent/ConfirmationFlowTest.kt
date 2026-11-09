@@ -210,6 +210,36 @@ class ConfirmationFlowTest {
     }
 
     @Test
+    fun explicitly_enabled_switch_keeps_the_short_circuit_semantics_unchanged() = runTest {
+        val tool = confirmationTool()
+        val executor = FakeCommandExecutor()
+        val gate = ConfirmationGate(executor, clock)
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求需确认的变更", ActionRequest("stop_timer")),
+        )
+
+        val outcome = ReActAgent(
+            reasoner,
+            ToolCatalog(
+                changeTools = listOf(tool),
+                executor = executor,
+                clock = clock,
+                gate = gate,
+                confirmationEnabled = true,
+            ),
+        ).run("请求")
+
+        // 显式开启与默认开启完全一致:短路终态、令牌在手、command 未派发
+        assertTrue(outcome is AgentOutcome.PendingConfirmation)
+        assertEquals(0, executor.dispatchCount)
+        assertEquals(
+            ConfirmationResolution.Executed(DISPATCHED_RESULT),
+            gate.confirm((outcome as AgentOutcome.PendingConfirmation).token),
+        )
+        assertEquals(1, executor.dispatchCount)
+    }
+
+    @Test
     fun pending_confirmation_chain_survives_a_json_round_trip() {
         val token = ConfirmationToken("confirm-7")
         val args = buildJsonObject { put("target", "readathon") }

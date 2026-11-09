@@ -228,6 +228,64 @@ class ChangeExecutionTest {
         ToolCatalog(changeTools = listOf(ScriptedChangeTool()), executor = FakeCommandExecutor())
     }
 
+    @Test
+    fun disabled_confirmation_switch_makes_confirmation_level_actions_unreachable() = runTest {
+        val tool = ScriptedChangeTool(riskLevels = setOf(RiskLevel.Confirmation), risk = RiskLevel.Confirmation)
+        val executor = FakeCommandExecutor()
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求需确认的变更", ActionRequest("stop_timer")),
+            ReasonerDecision.Answer(null, "该类操作暂不可用"),
+        )
+
+        val outcome = ReActAgent(
+            reasoner,
+            ToolCatalog(
+                changeTools = listOf(tool),
+                executor = executor,
+                clock = ChangeClockSource { ChangeClock(DISPATCH_NOW, DISPATCH_ZONE) },
+                confirmationEnabled = false,
+            ),
+        ).run("请求")
+
+        // 宁可不可用,不可绕过确认:错误观测回填,无待确认短路(即无令牌)、无派发、绝不静默转自动
+        assertEquals("该类操作暂不可用", (outcome as AgentOutcome.Answered).text)
+        val observation = reasoner.histories[1].last() as AgentEvent.Observation
+        assertTrue(observation.isError)
+        assertEquals(JsonPrimitive("需确认操作暂不可用"), observation.payload["error"])
+        assertEquals(0, executor.dispatchCount)
+        assertTrue(tool.parsedArgs.isEmpty())
+        assertTrue(tool.renderedResults.isEmpty())
+    }
+
+    @Test
+    fun disabled_confirmation_switch_stays_unreachable_even_with_a_gate_assembled() = runTest {
+        val tool = ScriptedChangeTool(riskLevels = setOf(RiskLevel.Confirmation), risk = RiskLevel.Confirmation)
+        val executor = FakeCommandExecutor()
+        val gate = ConfirmationGate(executor, ChangeClockSource { ChangeClock(DISPATCH_NOW, DISPATCH_ZONE) })
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求需确认的变更", ActionRequest("stop_timer")),
+            ReasonerDecision.Answer(null, "该类操作暂不可用"),
+        )
+
+        val outcome = ReActAgent(
+            reasoner,
+            ToolCatalog(
+                changeTools = listOf(tool),
+                executor = executor,
+                clock = ChangeClockSource { ChangeClock(DISPATCH_NOW, DISPATCH_ZONE) },
+                gate = gate,
+                confirmationEnabled = false,
+            ),
+        ).run("请求")
+
+        // 开关是构造期的整体裁决,优先于 gate 装配:关闭即不可达,gate 不产生令牌、不派发
+        assertEquals("该类操作暂不可用", (outcome as AgentOutcome.Answered).text)
+        val observation = reasoner.histories[1].last() as AgentEvent.Observation
+        assertTrue(observation.isError)
+        assertEquals(JsonPrimitive("需确认操作暂不可用"), observation.payload["error"])
+        assertEquals(0, executor.dispatchCount)
+    }
+
     private fun catalog(tool: ChangeTool, executor: CommandExecutor) = ToolCatalog(
         changeTools = listOf(tool),
         executor = executor,
