@@ -326,6 +326,75 @@ sealed interface AttentionCommand {
         override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
             AttentionCommandResult(state.restoreTargets(targetIds))
     }
+
+    // ---- 目标设定 command(P1.2 #242)----
+    // set_goal 工具族派发的领域通道:全部是对既有引擎纯函数的薄包装,不复制任何领域规则,
+    // 校验(归档状态、生效日约束、可用迁移分钟)都由引擎函数内部给出。目标动作不产时间
+    // 记录与里程碑,返回值只带 state。「当前规划日」一律由 command 的 (now, zone) 显式
+    // 折算(ADR-0005),不读系统时钟,测试与备份重放因此可以固定。
+
+    /** 给未归档目标追加一个周期阶段;正数分钟、一次性唯一与截止约束由引擎治理。 */
+    data class AddGoalStage(
+        val targetId: String,
+        val cadence: GoalCadence,
+        val targetMinutes: Int,
+        val startDate: String,
+        val dueDate: String? = null,
+    ) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addGoalStage(targetId, cadence, targetMinutes, startDate, dueDate))
+    }
+
+    /**
+     * 在已达成的一次性阶段之后追加新的一次性阶段。
+     * 新阶段的开始日取当前规划日——「接着上一个阶段继续」的语义里,用户说追加时
+     * 指的就是从现在开始;上一阶段是否达成由引擎在引擎侧校验。
+     */
+    data class AppendOneTimeGoalStage(
+        val targetId: String,
+        val targetMinutes: Int,
+    ) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(
+                state.appendOneTimeGoalStage(targetId, targetMinutes, state.planningDate(now, zone).toString()),
+            )
+    }
+
+    /** 登记一条未来目标规则;notBefore 取当前规划日,「必须从未来生效」由引擎治理。 */
+    data class AddFutureGoalRule(val rule: FutureGoalRule) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addFutureGoalRule(rule, state.planningDate(now, zone)))
+    }
+
+    /** 更新一条尚未生效的未来目标规则;目标与阶段不可改、已生效即拒改由引擎治理。 */
+    data class UpdateFutureGoalRule(val rule: FutureGoalRule) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.updateFutureGoalRule(rule, state.planningDate(now, zone)))
+    }
+
+    /** 取消(移除)一条尚未生效的未来目标规则;已生效即拒取消由引擎治理。 */
+    data class CancelFutureGoalRule(val ruleId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.cancelFutureGoalRule(ruleId, state.planningDate(now, zone)))
+    }
+
+    /** 登记一笔目标迁移;onDate 取当前规划日,去向生效窗口与可用缺口分钟由引擎治理。 */
+    data class AddMigration(val migration: Migration) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.addMigration(migration, state.planningDate(now, zone)))
+    }
+
+    /** 原地更新一笔未取消的迁移;可用缺口按移除旧账后的现状由引擎重算。 */
+    data class UpdateMigration(val migration: Migration) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.updateMigration(migration, state.planningDate(now, zone)))
+    }
+
+    /** 取消一笔迁移:标记 cancelled 而非删除,迁移历史保持可追溯。 */
+    data class CancelMigration(val migrationId: String) : AttentionCommand {
+        override fun execute(state: AttentionState, now: Instant, zone: ZoneId): AttentionCommandResult =
+            AttentionCommandResult(state.cancelMigration(migrationId))
+    }
 }
 
 /** Result returned by every [AttentionCommand]. */
