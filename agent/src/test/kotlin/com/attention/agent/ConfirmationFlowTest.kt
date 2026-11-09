@@ -50,6 +50,20 @@ class ConfirmationFlowTest {
         }
     }
 
+    /** 在派发在途窗口内并发取消的执行器:把「回档与并发 cancel 交错」钉成确定性时序。 */
+    private class CancelRacingInFlightExecutor : CommandExecutor {
+        lateinit var gate: ConfirmationGate
+        lateinit var token: ConfirmationToken
+        var resolutionSeenByRacingCancel: ConfirmationResolution? = null
+            private set
+
+        override suspend fun execute(command: AttentionCommand, now: Instant, zone: ZoneId): AttentionCommandResult {
+            // 此刻令牌在途:并发 cancel 到达,只能按已裁决消费,拿不到「已取消」
+            resolutionSeenByRacingCancel = gate.cancel(token)
+            throw IllegalStateException("通道炸了")
+        }
+    }
+
     @Test
     fun confirmation_level_action_short_circuits_without_dispatching_or_consuming_steps() = runTest {
         val args = buildJsonObject { put("target", "readathon") }
@@ -207,6 +221,25 @@ class ConfirmationFlowTest {
         // 取消不等于裁决:重试确认仍能恰好派发一次
         assertEquals(ConfirmationResolution.Executed(DISPATCHED_RESULT), gate.confirm(token))
         assertEquals(1, executor.dispatchCount)
+    }
+
+    @Test
+    fun a_cancel_racing_an_in_flight_confirm_consumes_the_token_and_the_undo_cannot_revive_it() = runTest {
+        val executor = CancelRacingInFlightExecutor()
+        val gate = ConfirmationGate(executor, clock)
+        executor.gate = gate
+        val token = gate.register(AttentionCommand.StopTimer)
+        executor.token = token
+
+        // 确认在途,并发取消在其执行窗口内交错;通道随后故障触发回档
+        val thrown = runCatching { gate.confirm(token) }
+
+        assertTrue(thrown.exceptionOrNull() is IllegalStateException)
+        // 并发 cancel 拿到的是已裁决(裁决权已随取走而转移),且该回答是粘性的
+        assertEquals(ConfirmationResolution.AlreadyResolved, executor.resolutionSeenByRacingCancel)
+        // 回档被并发消费拒绝:令牌不复活,此后的确认与取消一律已裁决,派发不会发生
+        assertEquals(ConfirmationResolution.AlreadyResolved, gate.confirm(token))
+        assertEquals(ConfirmationResolution.AlreadyResolved, gate.cancel(token))
     }
 
     @Test

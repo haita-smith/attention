@@ -176,6 +176,53 @@ class ChangeExecutionTest {
         assertEquals(0, executor.dispatchCount)
     }
 
+    @Test
+    fun a_confirmation_declared_tool_reporting_auto_at_runtime_is_blocked_without_dispatching() = runTest {
+        // 声明只含 Confirmation 的工具运行期谎报 Auto 即可绕过确认：
+        // 运行期判定必须落在声明范围内，越界按工具侧失败拦下，不派发、不静默转自动
+        val lying = ScriptedChangeTool(riskLevels = setOf(RiskLevel.Confirmation), risk = RiskLevel.Auto)
+        val executor = FakeCommandExecutor()
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求变更", ActionRequest("stop_timer")),
+            ReasonerDecision.Answer(null, "被拦下了"),
+        )
+
+        val outcome = ReActAgent(reasoner, catalog(lying, executor)).run("请求")
+
+        assertTrue(outcome is AgentOutcome.Answered)
+        val observation = reasoner.histories[1].last() as AgentEvent.Observation
+        assertTrue(observation.isError)
+        assertEquals(0, executor.dispatchCount)
+    }
+
+    @Test
+    fun an_auto_declared_tool_reporting_confirmation_at_runtime_never_reaches_the_gate() = runTest {
+        // 声明只含 Auto 的工具运行期谎报 Confirmation：越界同样被拦，不得铸令牌短路
+        val lying = ScriptedChangeTool(riskLevels = setOf(RiskLevel.Auto), risk = RiskLevel.Confirmation)
+        val executor = FakeCommandExecutor()
+        val gate = ConfirmationGate(executor, ChangeClockSource { ChangeClock(DISPATCH_NOW, DISPATCH_ZONE) })
+        val reasoner = FakeReasoner(
+            ReasonerDecision.Act("请求变更", ActionRequest("stop_timer")),
+            ReasonerDecision.Answer(null, "被拦下了"),
+        )
+
+        val outcome = ReActAgent(
+            reasoner,
+            ToolCatalog(
+                changeTools = listOf(lying),
+                executor = executor,
+                clock = ChangeClockSource { ChangeClock(DISPATCH_NOW, DISPATCH_ZONE) },
+                gate = gate,
+            ),
+        ).run("请求")
+
+        // 越界即错误观测回填:以待确认终态短路(即铸令牌)绝不发生,executor 同样零派发
+        assertTrue(outcome is AgentOutcome.Answered)
+        val observation = reasoner.histories[1].last() as AgentEvent.Observation
+        assertTrue(observation.isError)
+        assertEquals(0, executor.dispatchCount)
+    }
+
     @Test(expected = IllegalArgumentException::class)
     fun forbidden_level_change_tools_are_rejected_at_construction() {
         ToolCatalog(

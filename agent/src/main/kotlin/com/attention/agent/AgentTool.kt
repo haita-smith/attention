@@ -115,22 +115,38 @@ class ToolCatalog(
         return ToolExecution.Observed(AgentEvent.Observation(tool.execute(args)))
     }
 
-    /** 变更工具的三相编排：风险判定决定走向，只有 Auto 级在循环内即时派发。 */
+    /** 变更工具的三相编排：风险判定决定走向，只有落点仍在声明范围内的 Auto 级在循环内即时派发。 */
     private suspend fun executeChange(tool: ChangeTool, args: JsonObject): ToolExecution {
-        val risk = try {
+        val risk = guard(failure = { return ToolExecution.Observed(errorObservation(describeFailure(it))) }) {
             tool.riskLevel(args)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Throwable) {
-            return ToolExecution.Observed(errorObservation(describeFailure(failure)))
+        }
+        // 运行期判定必须落在 [ChangeTool.riskLevels] 的声明范围内：声明是该工具的能力边界契约，
+        // 范围外的谎报——尤其是只声明 Confirmation 的工具谎报 Auto——即可绕过确认。按工具侧失败
+        // 拦下，错误观测回填，不派发、不铸令牌，与「不可绕过确认」同一姿态。
+        if (risk !in tool.riskLevels) {
+            return ToolExecution.Observed(errorObservation("${tool.name} 返回了未声明的风险级别：$risk"))
         }
         return when (risk) {
             RiskLevel.Auto -> executeAuto(tool, args)
             RiskLevel.Confirmation -> executeConfirmation(tool, args)
-            // Forbidden 声明在注册期已被拒绝；这里只防工具运行期越级谎报，保持循环不抛。
+            // Forbidden 在注册期已被拒绝，永远落在声明范围之外；此分支只为 when 穷尽而保留兜底。
             RiskLevel.Forbidden -> ToolExecution.Observed(errorObservation("禁止执行的操作：${tool.name}"))
         }
     }
+
+    /**
+     * 变更执行各相共用的相位守卫：协程取消原样穿透，绝不吞成结果值；其余异常交
+     * [failure] 折算——内联展开使折算处能以非局部返回直接给出上层收敛值
+     * （工具侧失败折算为错误观测，执行通道故障折算为失败终态），各相不再各写一遍 try/catch。
+     */
+    private inline fun <V> guard(failure: (Throwable) -> Nothing, block: () -> V): V =
+        try {
+            block()
+        } catch (cancelled: CancellationException) {
+            throw cancelled
+        } catch (throwable: Throwable) {
+            failure(throwable)
+        }
 
     /**
      * 确认级的登记相：解析出 command 交给确认回调入口持有，以待确认结果短路上行。
@@ -142,39 +158,23 @@ class ToolCatalog(
         if (!confirmationEnabled || gate == null) {
             return ToolExecution.Observed(errorObservation("需确认操作暂不可用"))
         }
-        val command = try {
+        val command = guard(failure = { return ToolExecution.Observed(errorObservation(describeFailure(it))) }) {
             tool.command(args)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Throwable) {
-            return ToolExecution.Observed(errorObservation(describeFailure(failure)))
         }
         return ToolExecution.AwaitingConfirmation(gate.register(command))
     }
 
     /** Auto 级的派发相：解析与投影是工具侧失败（错误观测），executor 失败是通道故障（值上行）。 */
     private suspend fun executeAuto(tool: ChangeTool, args: JsonObject): ToolExecution {
-        val command = try {
+        val command = guard(failure = { return ToolExecution.Observed(errorObservation(describeFailure(it))) }) {
             tool.command(args)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Throwable) {
-            return ToolExecution.Observed(errorObservation(describeFailure(failure)))
         }
         val moment = requireNotNull(clockSource) { "变更工具缺少时钟来源" }.snapshot()
-        val result = try {
+        val result = guard(failure = { return ToolExecution.DispatchFailed(describeFailure(it)) }) {
             requireNotNull(dispatch) { "变更工具缺少执行通道" }.execute(command, moment.now, moment.zone)
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Throwable) {
-            return ToolExecution.DispatchFailed(describeFailure(failure))
         }
-        return try {
+        return guard(failure = { return ToolExecution.Observed(errorObservation(describeFailure(it))) }) {
             ToolExecution.Observed(AgentEvent.Observation(tool.observation(args, result)))
-        } catch (cancelled: CancellationException) {
-            throw cancelled
-        } catch (failure: Throwable) {
-            ToolExecution.Observed(errorObservation(describeFailure(failure)))
         }
     }
 }
