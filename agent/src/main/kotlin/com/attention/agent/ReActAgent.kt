@@ -39,6 +39,9 @@ class ReActAgent(
                 reasoner.reason(request, trace.toList())
             } catch (cancelled: CancellationException) {
                 throw cancelled
+            } catch (budget: TokenBudgetExceededException) {
+                // 预算耗尽不是失败：与步数耗尽同一语义，trace 保留到超限前。
+                return AgentOutcome.BudgetExhausted(trace)
             } catch (failure: Throwable) {
                 return AgentOutcome.Failed(describeFailure(failure), trace)
             }
